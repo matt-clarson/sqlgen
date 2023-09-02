@@ -1,3 +1,4 @@
+mod argparse;
 mod parse;
 
 use std::{
@@ -58,13 +59,41 @@ where
 
             let query = parser.parse_query(&query_sql, &schema)?;
 
-            queries.push(query.into_named(entry.name(), &query_sql));
+            let args = argparse::args(&query_sql);
+
+            let raw_query = replace(&query_sql, self.dialect, &args);
+
+            queries.push(query.into_named(entry.name(), &raw_query, args));
         }
+
+        queries.sort_unstable_by(|a,b| a.partial_cmp(b).unwrap());
 
         self.code_generator
             .codegen(&queries)
             .map_err(|err| err.into())
     }
+}
+
+fn replace<S: AsRef<str>>(sql: S, dialect: SqlDialect, args: &[argparse::Arg]) -> String {
+    let s = sql.as_ref();
+
+    let mut pos = 0;
+    
+    let mut out = args.iter().fold(String::new(), |acc, x| {
+        let binding = match dialect {
+            SqlDialect::Sqlite => "?"
+        };
+
+        let next = acc + &s[pos..x.pos()] + binding;
+
+        pos = x.pos() + x.len();
+
+        next
+    });
+
+    out.push_str(&s[pos..]);
+
+    out
 }
 
 pub struct QueriesEntry<R: Read> {

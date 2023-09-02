@@ -1,12 +1,14 @@
-use std::{borrow::Borrow, collections::HashMap};
+use std::{borrow::Borrow, collections::HashMap, fmt::Display};
 
 use sqlparser::{
-    ast::{self, SelectItem, SetExpr, Statement},
+    ast::{self, Expr, SelectItem, SetExpr, Statement, TableFactor},
     dialect,
     parser::Parser,
 };
 
 use crate::error::SqlgenError;
+
+use super::argparse;
 
 impl From<&super::SqlDialect> for Parser<'_> {
     fn from(dialect: &super::SqlDialect) -> Self {
@@ -16,10 +18,12 @@ impl From<&super::SqlDialect> for Parser<'_> {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub struct NamedQuery {
     name: String,
     query: Query,
     raw: String,
+    args: Vec<argparse::Arg>
 }
 
 impl NamedQuery {
@@ -32,7 +36,17 @@ impl NamedQuery {
     }
 
     pub fn raw(&self) -> &str {
-        self.raw.as_ref()
+        self.raw.trim()
+    }
+
+    pub fn args(&self) -> &[argparse::Arg] {
+        self.args.as_ref()
+    }
+}
+
+impl PartialOrd for NamedQuery {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.name.partial_cmp(&other.name)
     }
 }
 
@@ -43,14 +57,22 @@ pub struct Schema {
 
 impl Schema {
     pub fn get_table<S: AsRef<str>>(&self, name: S) -> Option<&Table> {
-        self.tables.iter().find(|&table| table.name.as_str() == name.as_ref())
+        self.tables
+            .iter()
+            .find(|&table| table.name.as_str() == name.as_ref())
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Table {
     name: String,
     fields: HashMap<String, FieldDef>,
+}
+
+impl PartialOrd for Table {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.name.partial_cmp(&other.name)
+    }
 }
 
 impl Table {
@@ -58,6 +80,10 @@ impl Table {
         let mut fields: Vec<&FieldDef> = self.fields.values().collect();
         fields.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         fields
+    }
+
+    pub fn find_field<S: AsRef<str>>(&self, name: S) -> Option<&FieldDef> {
+        self.fields.get(name.as_ref())
     }
 }
 
@@ -67,11 +93,12 @@ pub struct Query {
 }
 
 impl Query {
-    pub fn into_named<S: Into<String>>(self, name: S, raw: S) -> NamedQuery {
+    pub fn into_named<S: Into<String>>(self, name: S, raw: S, args: Vec<argparse::Arg>) -> NamedQuery {
         NamedQuery {
             name: name.into(),
             query: self,
             raw: raw.into(),
+            args,
         }
     }
 
@@ -94,9 +121,9 @@ impl PartialOrd for FieldDef {
 }
 
 impl FieldDef {
-    pub fn clone_with_alias<S: Into<String>>(&self, alias: S) -> Self {
+    pub fn clone_with_alias<S: std::fmt::Display>(&self, alias: S) -> Self {
         Self {
-            name: alias.into(),
+            name: alias.to_string(),
             sqltype: self.sqltype,
             nullable: self.nullable,
         }
@@ -115,10 +142,17 @@ impl FieldDef {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SqlType {
+    Bool,
+    Float32,
+    Float64,
+    Int8,
+    Int16,
     Int32,
+    Int64,
     Text,
+    Binary,
 }
 
 #[derive(Debug)]
@@ -158,54 +192,94 @@ impl Sqlparser {
         match stmt {
             sqlparser::ast::Statement::Query(query) => {
                 if query.with.is_some() {
-                    return Err(SqlgenError::Unsupported("CTEs are not supported".to_string()));
+                    return Err(SqlgenError::Unsupported(
+                        "CTEs are not supported".to_string(),
+                    ));
                 }
                 return match query.body.as_ref() {
                     SetExpr::Select(select) => {
-                        let mut query_tables = HashMap::new();
+                        let mut query_tables = QueryTables::new(schema);
                         for table_with_joins in &select.from {
-                            if !table_with_joins.joins.is_empty() {
-                                return Err(SqlgenError::Unsupported("queries with joins are not supported".to_string()));
+                            for join in &table_with_joins.joins {
+                                query_tables.try_insert_table_factor(&join.relation)?;
                             }
-                            match &table_with_joins.relation {
-                                sqlparser::ast::TableFactor::Table { name, alias, .. } => {
-                                    let table_name = alias
-                                        .as_ref()
-                                        .map(|a| a.name.to_string())
-                                        .unwrap_or_else(|| name.0.last().unwrap().to_string());
-                                    if let Some(table) = schema.get_table(&table_name) {
-                                        query_tables.insert(table_name, table);
-                                        Ok(())
-                                    } else {
-                                        return Err(SqlgenError::EntityNotFound(format!(
-                                            "table {name} does not exist in known schema"
-                                        )));
-                                    }
-                                }
-                                _ => Err(SqlgenError::Unsupported("only named table expressions are supported in FROM clauses".to_string())),
-                            }?;
+                            query_tables.try_insert_table_factor(&table_with_joins.relation)?;
                         }
 
                         for select_item in &select.projection {
                             match select_item {
                                 SelectItem::Wildcard(_) => {
-                                    for table in query_tables.values() {
-                                        for field in table.get_sorted_fields() {
-                                            out_query.projection.push(field.clone())
-                                        }
-                                    }
+                                    query_tables
+                                        .all_table_fields()
+                                        .into_iter()
+                                        .for_each(|field| out_query.projection.push(field.clone()));
                                     Ok(())
                                 }
-                                _ => Err(SqlgenError::Unsupported("only wildcard projections are supported".to_string())),
+                                SelectItem::QualifiedWildcard(table_name, _) => {
+                                    let name = table_name.to_string();
+                                    if let Some(table) = query_tables.find_table(&name) {
+                                        table.get_sorted_fields().into_iter().for_each(|field| {
+                                            out_query.projection.push(field.clone())
+                                        });
+                                        Ok(())
+                                    } else {
+                                        Err(SqlgenError::EntityNotFound(name))
+                                    }
+                                }
+                                SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                                    if let Some(field) = query_tables.find_field(&ident.value) {
+                                        out_query.projection.push(field.clone());
+                                        Ok(())
+                                    } else {
+                                        Err(SqlgenError::EntityNotFound(ident.to_string()))
+                                    }
+                                }
+                                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) => {
+                                    if let Some(field) = query_tables.find_qualified_field(idents) {
+                                        out_query.projection.push(field.clone());
+                                        Ok(())
+                                    } else {
+                                        Err(SqlgenError::EntityNotFound(compound_name(idents)))
+                                    }
+                                }
+                                SelectItem::ExprWithAlias {
+                                    expr: Expr::Identifier(ident),
+                                    alias,
+                                } => {
+                                    if let Some(field) = query_tables.find_field(&ident.value) {
+                                        out_query.projection.push(field.clone_with_alias(alias));
+                                        Ok(())
+                                    } else {
+                                        Err(SqlgenError::EntityNotFound(ident.to_string()))
+                                    }
+                                }
+                                SelectItem::ExprWithAlias {
+                                    expr: Expr::CompoundIdentifier(idents),
+                                    alias,
+                                } => {
+                                    if let Some(field) = query_tables.find_qualified_field(idents) {
+                                        out_query.projection.push(field.clone_with_alias(alias));
+                                        Ok(())
+                                    } else {
+                                        Err(SqlgenError::EntityNotFound(compound_name(idents)))
+                                    }
+                                }
+                                c => Err(SqlgenError::Unsupported(
+                                    format!("only wildcard and simple field projections are supported: got {c:?}",
+                                ))),
                             }?;
                         }
 
                         return Ok(out_query);
                     }
-                    _ => Err(SqlgenError::Unsupported("only SELECT statements are supported in queries".to_string())),
+                    _ => Err(SqlgenError::Unsupported(
+                        "only SELECT statements are supported in queries".to_string(),
+                    )),
                 };
             }
-            _ => Err(SqlgenError::Unsupported("only SELECT statements are supported in queries".to_string())),
+            _ => Err(SqlgenError::Unsupported(
+                "only SELECT statements are supported in queries".to_string(),
+            )),
         }
     }
 
@@ -231,8 +305,21 @@ impl Sqlparser {
                 for coldef in columns {
                     let field_name = coldef.name.to_string();
                     let sqltype = match &coldef.data_type {
-                        ast::DataType::Int(_) => SqlType::Int32,
+                        ast::DataType::Bool | ast::DataType::Boolean => SqlType::Bool,
+                        ast::DataType::TinyInt(_) => SqlType::Int8,
+                        ast::DataType::SmallInt(_) | ast::DataType::Int2(_) => SqlType::Int16,
+                        ast::DataType::Int4(_)
+                        | ast::DataType::Integer(_)
+                        | ast::DataType::MediumInt(_)
+                        | ast::DataType::Int(_) => SqlType::Int32,
+                        ast::DataType::BigInt(_) | ast::DataType::Int8(_) => SqlType::Int64,
                         ast::DataType::Text => SqlType::Text,
+                        ast::DataType::Real | ast::DataType::Float4 => SqlType::Float32,
+                        ast::DataType::Float(_)
+                        | ast::DataType::Float8
+                        | ast::DataType::Double
+                        | ast::DataType::DoublePrecision => SqlType::Float64,
+                        ast::DataType::Blob(_) => SqlType::Binary,
                         data_type => {
                             return Err(SqlgenError::Unsupported(format!(
                                 "data type {data_type} is not supported"
@@ -264,6 +351,83 @@ impl Sqlparser {
     }
 }
 
+struct QueryTables<'a> {
+    schema: &'a Schema,
+    tables: HashMap<String, Table>,
+}
+
+impl<'a> QueryTables<'a> {
+    fn new(schema: &'a Schema) -> Self {
+        Self {
+            schema,
+            tables: HashMap::new(),
+        }
+    }
+
+    fn insert<S: Into<String>>(&mut self, name: S, table: Table) {
+        self.tables.insert(name.into(), table);
+    }
+
+    fn find_table<S: AsRef<str>>(&self, table_name: S) -> Option<&Table> {
+        self.tables.get(table_name.as_ref())
+    }
+
+    fn all_table_fields(&self) -> Vec<&FieldDef> {
+        let mut fields: Vec<&FieldDef> = self
+            .tables
+            .values()
+            .flat_map(|t| t.fields.values())
+            .collect();
+        fields.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        fields
+    }
+
+    fn find_qualified_field<S: Display>(&self, name_parts: &[S]) -> Option<&FieldDef> {
+        let table_name = name_parts.first().unwrap().to_string();
+        let field_name = name_parts.last().unwrap().to_string();
+
+        self.tables
+            .get(&table_name)
+            .and_then(|table| table.find_field(&field_name))
+    }
+
+    fn find_field<S: AsRef<str>>(&self, field_name: S) -> Option<&FieldDef> {
+        for table in self.tables.values() {
+            if let Some(field) = table.find_field(field_name.as_ref()) {
+                return Some(field);
+            }
+        }
+        None
+    }
+
+    fn try_insert_table_factor(&mut self, table_factor: &TableFactor) -> Result<(), SqlgenError> {
+        match table_factor {
+            sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+                let table_name = alias
+                    .as_ref()
+                    .map(|a| a.name.to_string())
+                    .unwrap_or_else(|| name.0.last().unwrap().to_string());
+                if let Some(table) = self.schema.get_table(&name.to_string()) {
+                    self.insert(table_name, table.clone());
+                    Ok(())
+                } else {
+                    Err(SqlgenError::EntityNotFound(format!(
+                        "table {name} does not exist in known schema"
+                    )))
+                }
+            }
+            _ => Err(SqlgenError::Unsupported(
+                "only named table expressions are supported in FROM clauses".to_string(),
+            )),
+        }
+    }
+}
+
+fn compound_name<S: Display>(name: &[S]) -> String {
+    name.iter()
+        .fold(String::new(), |acc, n| acc + &n.to_string() + ".")
+}
+
 #[cfg(test)]
 mod test {
     use super::super::SqlDialect;
@@ -287,55 +451,64 @@ mod test {
         assert_eq!(expected, actual);
     }
 
-    #[test]
-    fn parse_table_with_int_column() {
-        let expected = Schema {
-            tables: vec![Table {
-                name: "t1".to_string(),
-                fields: HashMap::from([(
-                    "col".to_string(),
-                    FieldDef {
-                        name: "col".to_string(),
-                        sqltype: SqlType::Int32,
-                        nullable: true,
-                    },
-                )]),
-            }],
+    macro_rules! table_with_typed_column_test {
+        ($test_fn:ident, $str_type:expr, $sql_type:expr) => {
+            #[test]
+            fn $test_fn() {
+                let expected = Schema {
+                    tables: vec![Table {
+                        name: "t1".to_string(),
+                        fields: HashMap::from([(
+                            "col".to_string(),
+                            FieldDef {
+                                name: "col".to_string(),
+                                sqltype: $sql_type,
+                                nullable: true,
+                            },
+                        )]),
+                    }],
+                };
+
+                let parser = Sqlparser {
+                    dialect: SqlDialect::Sqlite,
+                };
+
+                let actual = parser
+                    .parse_schema(format!("CREATE TABLE t1(col {});", $str_type))
+                    .unwrap();
+
+                assert_eq!(expected, actual);
+            }
         };
-
-        let parser = Sqlparser {
-            dialect: SqlDialect::Sqlite,
-        };
-
-        let actual = parser.parse_schema("CREATE TABLE t1(col INT);").unwrap();
-
-        assert_eq!(expected, actual);
     }
 
-    #[test]
-    fn parse_table_with_text_column() {
-        let expected = Schema {
-            tables: vec![Table {
-                name: "t1".to_string(),
-                fields: HashMap::from([(
-                    "col".to_string(),
-                    FieldDef {
-                        name: "col".to_string(),
-                        sqltype: SqlType::Text,
-                        nullable: true,
-                    },
-                )]),
-            }],
-        };
-
-        let parser = Sqlparser {
-            dialect: SqlDialect::Sqlite,
-        };
-
-        let actual = parser.parse_schema("CREATE TABLE t1(col TEXT);").unwrap();
-
-        assert_eq!(expected, actual);
-    }
+    table_with_typed_column_test!(parse_table_with_bool_column, "BOOL", SqlType::Bool);
+    table_with_typed_column_test!(parse_table_with_boolean_column, "BOOLEAN", SqlType::Bool);
+    table_with_typed_column_test!(parse_table_with_tinyint_column, "TINYINT", SqlType::Int8);
+    table_with_typed_column_test!(parse_table_with_smallint_column, "SMALLINT", SqlType::Int16);
+    table_with_typed_column_test!(parse_table_with_int2_column, "INT2", SqlType::Int16);
+    table_with_typed_column_test!(parse_table_with_int_column, "INT", SqlType::Int32);
+    table_with_typed_column_test!(parse_table_with_integer_column, "INTEGER", SqlType::Int32);
+    table_with_typed_column_test!(
+        parse_table_with_mediumint_column,
+        "MEDIUMINT",
+        SqlType::Int32
+    );
+    table_with_typed_column_test!(parse_table_with_int4_column, "INT4", SqlType::Int32);
+    table_with_typed_column_test!(parse_table_with_bigint_column, "BIGINT", SqlType::Int64);
+    table_with_typed_column_test!(parse_table_with_int8_column, "INT8", SqlType::Int64);
+    table_with_typed_column_test!(parse_table_with_text_column, "TEXT", SqlType::Text);
+    table_with_typed_column_test!(parse_table_with_real_column, "REAL", SqlType::Float32);
+    table_with_typed_column_test!(parse_table_with_float4_column, "FLOAT4", SqlType::Float32);
+    table_with_typed_column_test!(parse_table_with_float_column, "FLOAT", SqlType::Float64);
+    table_with_typed_column_test!(parse_table_with_float8_column, "FLOAT8", SqlType::Float64);
+    table_with_typed_column_test!(parse_table_with_double_column, "DOUBLE", SqlType::Float64);
+    table_with_typed_column_test!(
+        parse_table_with_double_precision_column,
+        "DOUBLE PRECISION",
+        SqlType::Float64
+    );
+    table_with_typed_column_test!(parse_table_with_blob_column, "BLOB", SqlType::Binary);
 
     #[test]
     fn parse_table_primary_key() {
@@ -389,6 +562,260 @@ mod test {
             .parse_schema("CREATE TABLE t1(id INT NOT NULL, col_a TEXT);")
             .unwrap();
         let actual = parser.parse_query("SELECT * FROM t1;", &schema).unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_named_fields_query() {
+        let expected = Query {
+            projection: vec![
+                FieldDef {
+                    name: "id".to_string(),
+                    sqltype: SqlType::Int32,
+                    nullable: false,
+                },
+                FieldDef {
+                    name: "col_a".to_string(),
+                    sqltype: SqlType::Text,
+                    nullable: true,
+                },
+            ],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(id INT NOT NULL, col_a TEXT, col_b INT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT id, col_a FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_aliased_fields_query() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "aliased".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(id INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT id aliased FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_as_aliased_fields_query() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "aliased".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(id INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT id AS aliased FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_multiple_table_query() {
+        let expected = Query {
+            projection: vec![
+                FieldDef {
+                    name: "col_a".to_string(),
+                    sqltype: SqlType::Int32,
+                    nullable: false,
+                },
+                FieldDef {
+                    name: "col_b".to_string(),
+                    sqltype: SqlType::Text,
+                    nullable: true,
+                },
+            ],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL); CREATE TABLE t2(col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT col_a, col_b FROM t1, t2;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_multiple_table_wildcard_query() {
+        let expected = Query {
+            projection: vec![
+                FieldDef {
+                    name: "col_a".to_string(),
+                    sqltype: SqlType::Int32,
+                    nullable: false,
+                },
+                FieldDef {
+                    name: "col_b".to_string(),
+                    sqltype: SqlType::Text,
+                    nullable: true,
+                },
+            ],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL); CREATE TABLE t2(col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT * FROM t1, t2;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_multiple_table_multiple_wildcards_query() {
+        let expected = Query {
+            projection: vec![
+                FieldDef {
+                    name: "col_b".to_string(),
+                    sqltype: SqlType::Text,
+                    nullable: true,
+                },
+                FieldDef {
+                    name: "col_a".to_string(),
+                    sqltype: SqlType::Int32,
+                    nullable: false,
+                },
+            ],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL); CREATE TABLE t2(col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT t2.*, t1.* FROM t1, t2;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_joined_query() {
+        let expected = Query {
+            projection: vec![
+                FieldDef {
+                    name: "col_a".to_string(),
+                    sqltype: SqlType::Int32,
+                    nullable: false,
+                },
+                FieldDef {
+                    name: "col_b".to_string(),
+                    sqltype: SqlType::Text,
+                    nullable: true,
+                },
+            ],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL); CREATE TABLE t2(id INT NOT NULL, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query(
+                "SELECT col_a, col_b FROM t1 JOIN t2 ON t1.col_a=t2.id;",
+                &schema,
+            )
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_compound_field_query() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "col_a".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT t1.col_a FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_compound_field_aliased_query() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "x".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT t1.col_a AS x FROM t1;", &schema)
+            .unwrap();
 
         assert_eq!(expected, actual);
     }

@@ -14,6 +14,9 @@ impl Codegen for TSCodegen {
         self.base_types(&mut out);
 
         for query in queries {
+            if !query.args().is_empty() {
+                self.arg_type(&mut out, query);
+            }
             self.result_type(&mut out, query);
             self.function(&mut out, query);
         }
@@ -32,9 +35,30 @@ impl TSCodegen {
     }
 
     fn base_types(&self, s: &mut String) {
-        s.push_str("export interface Dispatcher<TResult> {\n");
+        s.push_str(
+            "export interface Dispatcher<TResult, TArg extends Record<string, unknown> = {}> {\n",
+        );
         s.push_str("    (query: string): Promise<TResult[]>;\n");
+        s.push_str("    (query: string, args: Array<TArg[keyof TArg]>): Promise<TResult[]>;\n");
         s.push_str("}\n\n");
+    }
+
+    fn arg_type(&self, s: &mut String, named_query: &NamedQuery) {
+        let mut arg_name = upper_camel_case(named_query.name());
+        arg_name.push_str("Arg");
+
+        s.push_str("export type ");
+        s.push_str(arg_name.as_str());
+        s.push_str(" = {\n");
+
+        for arg in named_query.args() {
+            s.push_str("    ");
+            s.push_str(camel_case(arg.ident()).as_str());
+            s.push_str(": ");
+            s.push_str(arg.sql_type().into());
+            s.push_str(";\n");
+        }
+        s.push_str("};\n\n");
     }
 
     fn result_type(&self, s: &mut String, named_query: &NamedQuery) {
@@ -62,21 +86,43 @@ impl TSCodegen {
         let function_name = camel_case(named_query.name());
         let mut result_name = upper_camel_case(named_query.name());
         result_name.push_str("Result");
+        let mut arg_name = upper_camel_case(named_query.name());
+        arg_name.push_str("Arg");
 
         s.push_str("export async function ");
         s.push_str(function_name.as_str());
         s.push_str("(\n");
         s.push_str("    dispatch: Dispatcher<");
         s.push_str(result_name.as_str());
+        if !named_query.args().is_empty() {
+            s.push_str(", ");
+            s.push_str(arg_name.as_str());
+        }
         s.push_str(">,\n");
+        if !named_query.args().is_empty() {
+            s.push_str("    arg: ");
+            s.push_str(arg_name.as_str());
+            s.push_str(",\n");
+        }
         s.push_str("): Promise<");
         s.push_str(result_name.as_str());
         s.push_str("[]> {\n");
 
         s.push_str("    const query = `\n");
         s.push_str(indent_lines(named_query.raw(), "        ").as_str());
+        s.push('\n');
         s.push_str("    `;\n\n");
-        s.push_str("    return dispatch(query);\n");
+        if named_query.args().is_empty() {
+            s.push_str("    return dispatch(query);\n");
+        } else {
+            s.push_str("    return dispatch(query, [\n");
+            for arg in named_query.args() {
+                s.push_str("        arg.");
+                s.push_str(arg.ident());
+                s.push_str(",\n");
+            }
+            s.push_str("    ]);\n");
+        }
         s.push_str("}\n\n");
     }
 }
@@ -84,8 +130,15 @@ impl TSCodegen {
 impl From<SqlType> for &'static str {
     fn from(sql_type: SqlType) -> Self {
         match sql_type {
-            SqlType::Int32 => "number",
+            SqlType::Bool => "boolean",
+            SqlType::Int8
+            | SqlType::Int16
+            | SqlType::Int32
+            | SqlType::Int64
+            | SqlType::Float32
+            | SqlType::Float64 => "number",
             SqlType::Text => "string",
+            SqlType::Binary => "ArrayBuffer",
         }
     }
 }

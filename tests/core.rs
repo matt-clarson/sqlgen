@@ -8,9 +8,9 @@ use sqlgen::{
 
 #[test]
 fn typescript_sqlite_simple() -> io::Result<()> {
-    let schemafile = "tests/fixtures/typescript/sqlite/simple/schema.sql";
-    let queriesdir = "tests/fixtures/typescript/sqlite/simple/queries";
-    let outputfile = "tests/fixtures/typescript/sqlite/simple/output/queries.ts";
+    let schemafile = "examples/typescript/sqlite/simple/schema.sql";
+    let queriesdir = "examples/typescript/sqlite/simple/queries";
+    let outputfile = "examples/typescript/sqlite/simple/output/queries.ts";
 
     let expected = fs::read_to_string(outputfile).unwrap();
 

@@ -4,7 +4,7 @@ use std::io;
 pub enum SqlgenBuilderError {
     SchemaFileMissing,
     QueryDirMissing,
-    CodeGeneratorMissing
+    CodeGeneratorMissing,
 }
 impl std::fmt::Display for SqlgenBuilderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -64,7 +64,7 @@ impl From<io::Error> for SqlgenError {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum CodegenError {
-  Unknown(String)
+    Unknown(String),
 }
 impl std::fmt::Display for CodegenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,20 +75,20 @@ impl std::fmt::Display for CodegenError {
 }
 impl std::error::Error for CodegenError {}
 
-#[derive(Debug,  Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum QueriesError {
     IoError(String),
-    PathError(String)
+    PathError(String),
 }
 impl std::fmt::Display for QueriesError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::IoError(err) => write!(f, "io error: {err}"),
-            Self::PathError(msg) => write!(f, "path error: {msg}")
+            Self::PathError(msg) => write!(f, "path error: {msg}"),
         }
     }
 }
-impl std::error::Error for QueriesError{}
+impl std::error::Error for QueriesError {}
 impl From<io::Error> for QueriesError {
     fn from(err: io::Error) -> Self {
         Self::IoError(err.to_string())
