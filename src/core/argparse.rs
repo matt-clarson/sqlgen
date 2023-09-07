@@ -80,15 +80,11 @@ impl<'a> ArgParse<'a> {
 
     fn ident(&mut self) -> Option<String> {
         let mut ident = String::new();
-        loop {
-            if let Some((_, c)) = self
-                .iter
-                .next_if(|n| matches!(n.1, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_'))
-            {
-                ident.push(c);
-            } else {
-                break;
-            }
+        while let Some((_, c)) = self
+            .iter
+            .next_if(|n| matches!(n.1, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_'))
+        {
+            ident.push(c);
         }
         if ident.is_empty() {
             None
@@ -101,7 +97,7 @@ impl<'a> ArgParse<'a> {
     }
 
     fn take_non_dollar(&mut self) {
-        while let Some(_) = self.iter.next_if(|n| n.1 != '$') {}
+        while self.iter.next_if(|n| n.1 != '$').is_some() {}
     }
 }
 

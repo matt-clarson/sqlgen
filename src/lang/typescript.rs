@@ -8,17 +8,19 @@ use super::Codegen;
 pub struct TSCodegen {}
 
 impl Codegen for TSCodegen {
-    fn codegen(&self, queries: &[NamedQuery]) -> Result<String, CodegenError> {
+    fn codegen(&self, named_queries: &[NamedQuery]) -> Result<String, CodegenError> {
         let mut out = String::new();
         self.header_comment(&mut out);
         self.base_types(&mut out);
 
-        for query in queries {
-            if !query.args().is_empty() {
-                self.arg_type(&mut out, query);
+        for named_query in named_queries {
+            if !named_query.args().is_empty() {
+                self.arg_type(&mut out, named_query);
             }
-            self.result_type(&mut out, query);
-            self.function(&mut out, query);
+            if !named_query.query().projection().is_empty() {
+                self.result_type(&mut out, named_query);
+            }
+            self.function(&mut out, named_query);
         }
 
         Ok(out)
@@ -36,15 +38,18 @@ impl TSCodegen {
 
     fn base_types(&self, s: &mut String) {
         s.push_str(
-            "export interface Dispatcher<TResult, TArg extends Record<string, unknown> = {}> {\n",
+            "export type Dispatcher<TResult, TArg extends Record<string, unknown> = {}> = TResult extends void ? {\n",
         );
+        s.push_str("    (query: string): Promise<void>;\n");
+        s.push_str("    (query: string, args: Array<TArg[keyof TArg]>): Promise<void>;\n");
+        s.push_str("} : {\n");
         s.push_str("    (query: string): Promise<TResult[]>;\n");
         s.push_str("    (query: string, args: Array<TArg[keyof TArg]>): Promise<TResult[]>;\n");
         s.push_str("}\n\n");
     }
 
     fn arg_type(&self, s: &mut String, named_query: &NamedQuery) {
-        let mut arg_name = upper_camel_case(named_query.name());
+        let mut arg_name = pascal_case(named_query.name());
         arg_name.push_str("Arg");
 
         s.push_str("export type ");
@@ -62,7 +67,7 @@ impl TSCodegen {
     }
 
     fn result_type(&self, s: &mut String, named_query: &NamedQuery) {
-        let mut result_name = upper_camel_case(named_query.name());
+        let mut result_name = pascal_case(named_query.name());
         result_name.push_str("Result");
 
         s.push_str("export type ");
@@ -84,16 +89,20 @@ impl TSCodegen {
 
     fn function(&self, s: &mut String, named_query: &NamedQuery) {
         let function_name = camel_case(named_query.name());
-        let mut result_name = upper_camel_case(named_query.name());
+        let mut result_name = pascal_case(named_query.name());
         result_name.push_str("Result");
-        let mut arg_name = upper_camel_case(named_query.name());
+        let mut arg_name = pascal_case(named_query.name());
         arg_name.push_str("Arg");
 
         s.push_str("export async function ");
         s.push_str(function_name.as_str());
         s.push_str("(\n");
         s.push_str("    dispatch: Dispatcher<");
+        if named_query.query().projection().is_empty() {
+            s.push_str("void");
+        } else {
         s.push_str(result_name.as_str());
+        }
         if !named_query.args().is_empty() {
             s.push_str(", ");
             s.push_str(arg_name.as_str());
@@ -105,20 +114,30 @@ impl TSCodegen {
             s.push_str(",\n");
         }
         s.push_str("): Promise<");
+        if named_query.query().projection().is_empty() {
+            s.push_str("void");
+        } else {
         s.push_str(result_name.as_str());
-        s.push_str("[]> {\n");
+        s.push_str("[]");
+        }
+        s.push_str("> {\n");
 
         s.push_str("    const query = `\n");
         s.push_str(indent_lines(named_query.raw(), "        ").as_str());
         s.push('\n');
         s.push_str("    `;\n\n");
-        if named_query.args().is_empty() {
-            s.push_str("    return dispatch(query);\n");
+        if named_query.query().projection().is_empty() {
+            s.push_str("    await ");
         } else {
-            s.push_str("    return dispatch(query, [\n");
+            s.push_str("    return ");
+        }
+        if named_query.args().is_empty() {
+            s.push_str("dispatch(query);\n");
+        } else {
+            s.push_str("dispatch(query, [\n");
             for arg in named_query.args() {
                 s.push_str("        arg.");
-                s.push_str(arg.ident());
+                s.push_str(camel_case(arg.ident()).as_str());
                 s.push_str(",\n");
             }
             s.push_str("    ]);\n");
@@ -143,20 +162,20 @@ impl From<SqlType> for &'static str {
     }
 }
 
-/// Converts a string to upper camel case. '-', '_', and whitespace characters are removed, any
+/// Converts a string to pascal case. '-', '_', and whitespace characters are removed
 /// character directly trailing these is upper-cased. First character is also upper-cased.
 /// # Examples
 ///
 /// ```
-/// use sqlgen::lang::typescript::upper_camel_case;
+/// use sqlgen::lang::typescript::pascal_case;
 ///
-/// assert_eq!("HelloWorld".to_string(), upper_camel_case("hello world"));
+/// assert_eq!("HelloWorld".to_string(), pascal_case("hello world"));
 ///
-/// assert_eq!("WithUnderscores".to_string(), upper_camel_case("with_underscores"));
+/// assert_eq!("WithUnderscores".to_string(), pascal_case("with_underscores"));
 ///
-/// assert_eq!("PathLike".to_string(), upper_camel_case("path-like"));
+/// assert_eq!("PathLike".to_string(), pascal_case("path-like"));
 /// ```
-pub fn upper_camel_case<S: AsRef<str>>(s: S) -> String {
+pub fn pascal_case<S: AsRef<str>>(s: S) -> String {
     let mut out = String::new();
 
     let mut upper_next = true;
