@@ -2,6 +2,8 @@
 
 A CLI tool for generating typed code for SQL queries.
 
+![CI](https://github.com/matt-clarson/sqlgen/actions/workflows/ci.yml/badge.svg)
+
 ## Get Started
 
 Define a database schema using SQL, put it in a file called `schema.sql`:

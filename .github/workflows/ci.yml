@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+      branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    - run: >
+        rustup toolchain install stable \
+          --profile minimal \
+          --no-self-update \
+          --component clippy
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: cargo-build
+    - name: Build
+      run: cargo build
+  lint:
+    runs-on: ubuntu-latest
+    needs: [setup]
+    steps:
+    - uses: actions/checkout@v3
+    - run: >
+        rustup toolchain install stable \
+          --profile minimal \
+          --no-self-update \
+          --component clippy
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: cargo-build
+    
+    - name: Run clippy
+      run: >
+        cargo clippy --
+        -D clippy::all
+        
+  test:
+    runs-on: ubuntu-latest
+    needs: [setup]
+    steps:
+    - uses: actions/checkout@v3
+    - run: >
+        rustup toolchain install stable \
+          --profile minimal \
+          --no-self-update \
+          --component clippy
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: cargo-build
+    - name: Run tests
+      run: cargo test
