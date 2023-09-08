@@ -2,6 +2,11 @@
 name = "sqlgen"
 version = "0.1.0"
 edition = "2021"
+authors = ["Matt Clarson<clarsgon469@gmail.com>"]
+description = "CLI tool for generating code from SQL schemas and queries"
+readme = "README.md"
+license = "MIT"
+publish = false
 
 [dev-dependencies]
 pretty_assertions = "1.4.0"
