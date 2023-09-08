@@ -138,12 +138,12 @@ type = "tinyint" | "smallint" | "int" | "bigint"
      | "float" | "double" | "bool" | "text" | "blob";
 alpha = "A" | "B" | "C" | "D" | "E" | "F" | "G"
       | "H" | "I" | "J" | "K" | "L" | "M" | "N"
-       | "O" | "P" | "Q" | "R" | "S" | "T" | "U"
-       | "V" | "W" | "X" | "Y" | "Z" | "a" | "b"
-       | "c" | "d" | "e" | "f" | "g" | "h" | "i"
-       | "j" | "k" | "l" | "m" | "n" | "o" | "p"
-       | "q" | "r" | "s" | "t" | "u" | "v" | "w"
-       | "x" | "y" | "z" | "_" ;
+      | "O" | "P" | "Q" | "R" | "S" | "T" | "U"
+      | "V" | "W" | "X" | "Y" | "Z" | "a" | "b"
+      | "c" | "d" | "e" | "f" | "g" | "h" | "i"
+      | "j" | "k" | "l" | "m" | "n" | "o" | "p"
+      | "q" | "r" | "s" | "t" | "u" | "v" | "w"
+      | "x" | "y" | "z" | "_" ;
 ```
 
 Given the SQL schemas we've already defined above, we could have the following query:
@@ -196,7 +196,7 @@ The following SQL is currently understood by the `sqlgen` parser - support for o
 | Type                                                    | Supported |
 | ------------------------------------------------------- | --------- |
 | SELECT statements                                       | ✅        |
-| Aliases (fields and tables) | ✅ |
+| Aliases (fields and tables)                             | ✅        |
 | JOINs                                                   | ✅        |
 | CTEs                                                    | ❌        |
 | Subqueries                                              | ❌        |
