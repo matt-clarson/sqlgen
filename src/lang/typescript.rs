@@ -37,14 +37,28 @@ impl TSCodegen {
     }
 
     fn base_types(&self, s: &mut String) {
-        s.push_str(
-            "export type Dispatcher<TResult, TArg extends Record<string, unknown> = {}> = TResult extends void ? {\n",
-        );
-        s.push_str("    (query: string): Promise<void>;\n");
-        s.push_str("    (query: string, args: Array<TArg[keyof TArg]>): Promise<void>;\n");
-        s.push_str("} : {\n");
-        s.push_str("    (query: string): Promise<TResult[]>;\n");
-        s.push_str("    (query: string, args: Array<TArg[keyof TArg]>): Promise<TResult[]>;\n");
+        s.push_str("export interface Dispatcher {\n");
+        s.push_str("    (query: string, args?: unknown[]): Promise<{\n");
+        s.push_str("        keys: string[];\n");
+        s.push_str("        rows: unknown[][];\n");
+        s.push_str("    }>;\n");
+        s.push_str("}\n\n");
+
+        s.push_str("function mapRows<TResult>(keys: string[], rows: unknown[][]): TResult[] {\n");
+        s.push_str("    const out = Array(rows.length)\n");
+        s.push_str("    for (let i = 0; i < out.length; i++) {\n");
+        s.push_str("        const row = rows[i];\n");
+        s.push_str("        out[i] = Object.fromEntries(pairs(keys, row));\n");
+        s.push_str("    }\n");
+        s.push_str("    return out as TResult[];\n");
+        s.push_str("}\n\n");
+
+        s.push_str("function pairs<T, U>(xs: T[], ys: U[]): [T, U][] {\n");
+        s.push_str("    const out = Array(xs.length)\n");
+        s.push_str("    for (let i = 0; i < out.length; i++) {\n");
+        s.push_str("        out[i] = [xs[i], ys[i]];\n");
+        s.push_str("    }\n");
+        s.push_str("    return out;\n");
         s.push_str("}\n\n");
     }
 
@@ -97,17 +111,7 @@ impl TSCodegen {
         s.push_str("export async function ");
         s.push_str(function_name.as_str());
         s.push_str("(\n");
-        s.push_str("    dispatch: Dispatcher<");
-        if named_query.query().projection().is_empty() {
-            s.push_str("void");
-        } else {
-        s.push_str(result_name.as_str());
-        }
-        if !named_query.args().is_empty() {
-            s.push_str(", ");
-            s.push_str(arg_name.as_str());
-        }
-        s.push_str(">,\n");
+        s.push_str("    dispatch: Dispatcher,\n");
         if !named_query.args().is_empty() {
             s.push_str("    arg: ");
             s.push_str(arg_name.as_str());
@@ -117,8 +121,8 @@ impl TSCodegen {
         if named_query.query().projection().is_empty() {
             s.push_str("void");
         } else {
-        s.push_str(result_name.as_str());
-        s.push_str("[]");
+            s.push_str(result_name.as_str());
+            s.push_str("[]");
         }
         s.push_str("> {\n");
 
@@ -127,20 +131,32 @@ impl TSCodegen {
         s.push('\n');
         s.push_str("    `;\n\n");
         if named_query.query().projection().is_empty() {
-            s.push_str("    await ");
-        } else {
-            s.push_str("    return ");
-        }
-        if named_query.args().is_empty() {
-            s.push_str("dispatch(query);\n");
-        } else {
-            s.push_str("dispatch(query, [\n");
-            for arg in named_query.args() {
-                s.push_str("        arg.");
-                s.push_str(camel_case(arg.ident()).as_str());
-                s.push_str(",\n");
+            if named_query.args().is_empty() {
+                s.push_str("    await dispatch(query);\n");
+            } else {
+                s.push_str("    await dispatch(query, [\n");
+                for arg in named_query.args() {
+                    s.push_str("        arg.");
+                    s.push_str(camel_case(arg.ident()).as_str());
+                    s.push_str(",\n");
+                }
+                s.push_str("    ]);\n");
             }
-            s.push_str("    ]);\n");
+        } else {
+            if named_query.args().is_empty() {
+                s.push_str("    const result = await dispatch(query);\n");
+            } else {
+                s.push_str("    const result = await dispatch(query, [\n");
+                for arg in named_query.args() {
+                    s.push_str("        arg.");
+                    s.push_str(camel_case(arg.ident()).as_str());
+                    s.push_str(",\n");
+                }
+                s.push_str("    ]);\n")
+            }
+            s.push_str("    return mapRows<");
+            s.push_str(result_name.as_str());
+            s.push_str(">(result.keys, result.rows);\n");
         }
         s.push_str("}\n\n");
     }
