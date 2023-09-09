@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, collections::HashMap, fmt::Display};
+use std::{borrow::Borrow, collections::HashMap, fmt::Display, hash::Hash};
 
 use sqlparser::{
     ast::{self, Expr, ObjectName, SelectItem, SetExpr, Statement, TableFactor},
@@ -66,7 +66,7 @@ impl Schema {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Table {
     name: String,
-    fields: HashMap<String, FieldDef>,
+    fields: OrderedHashMap<String, FieldDef>,
 }
 
 impl PartialOrd for Table {
@@ -76,10 +76,19 @@ impl PartialOrd for Table {
 }
 
 impl Table {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            fields: OrderedHashMap::new(),
+        }
+    }
+
+    pub fn insert_field(&mut self, name: String, field_def: FieldDef) {
+        self.fields.insert(name, field_def);
+    }
+
     pub fn get_sorted_fields(&self) -> Vec<&FieldDef> {
-        let mut fields: Vec<&FieldDef> = self.fields.values().collect();
-        fields.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        fields
+        self.fields.values().collect()
     }
 
     pub fn find_field<S: AsRef<str>>(&self, name: S) -> Option<&FieldDef> {
@@ -311,7 +320,7 @@ impl Sqlparser {
         match stmt {
             sqlparser::ast::Statement::CreateTable { name, columns, .. } => {
                 let table_name = name.0.last().unwrap().to_string();
-                let mut fields = HashMap::new();
+                let mut table = Table::new(table_name);
                 for coldef in columns {
                     let field_name = coldef.name.to_string();
                     let sqltype = match &coldef.data_type {
@@ -348,12 +357,8 @@ impl Sqlparser {
                         sqltype,
                         nullable: !not_null,
                     };
-                    fields.insert(field_name, field);
+                    table.insert_field(field_name, field);
                 }
-                let table = Table {
-                    name: table_name,
-                    fields,
-                };
                 Ok(Some(table))
             }
             _ => Ok(None),
@@ -361,16 +366,63 @@ impl Sqlparser {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct OrderedHashMap<K: Clone + Eq + PartialEq + Hash, V> {
+    hash_map: HashMap<K, V>,
+    ordered_keys: Vec<K>,
+}
+
+impl<K: Clone + Eq + PartialEq + Hash, V> OrderedHashMap<K, V> {
+    pub fn new() -> Self {
+        Self {
+            hash_map: HashMap::new(),
+            ordered_keys: Vec::new(),
+        }
+    }
+
+    pub fn insert(&mut self, k: K, v: V) {
+        self.hash_map.insert(k.clone(), v);
+        self.ordered_keys.push(k);
+    }
+
+    pub fn get<Q>(&self, k: &Q) -> Option<&V>
+        where
+            Q: ?Sized,
+            K: Borrow<Q>,
+            Q: Eq + Hash
+    {
+        self.hash_map.get(k)
+    }
+
+    pub fn values<'a>(&'a self) -> Box<dyn Iterator<Item = &V> + 'a> {
+        let iter = self
+            .ordered_keys
+            .iter()
+            .map(|k| unsafe { self.hash_map.get(k).unwrap_unchecked() });
+        Box::new(iter)
+    }
+}
+
+impl <K: Clone + Eq + PartialEq + Hash, V, const N: usize> From<[(K, V); N]> for OrderedHashMap<K, V> {
+    fn from(pairs: [(K, V); N]) -> Self {
+        let mut hash_map = Self::new();
+        for (k, v) in pairs {
+            hash_map.insert(k, v);
+        }
+        hash_map
+    }
+}
+
 struct QueryTables<'a> {
     schema: &'a Schema,
-    tables: HashMap<String, Table>,
+    tables: OrderedHashMap<String, Table>,
 }
 
 impl<'a> QueryTables<'a> {
     fn new(schema: &'a Schema) -> Self {
         Self {
             schema,
-            tables: HashMap::new(),
+            tables: OrderedHashMap::new(),
         }
     }
 
@@ -383,13 +435,10 @@ impl<'a> QueryTables<'a> {
     }
 
     fn all_table_fields(&self) -> Vec<&FieldDef> {
-        let mut fields: Vec<&FieldDef> = self
-            .tables
+        self.tables
             .values()
-            .flat_map(|t| t.fields.values())
-            .collect();
-        fields.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        fields
+            .flat_map(|t| t.get_sorted_fields())
+            .collect()
     }
 
     fn find_qualified_field<S: Display>(&self, name_parts: &[S]) -> Option<&FieldDef> {
@@ -534,7 +583,7 @@ mod test {
         let expected = Schema {
             tables: vec![Table {
                 name: "empty".to_string(),
-                fields: HashMap::new(),
+                fields: OrderedHashMap::new(),
             }],
         };
 
@@ -554,7 +603,7 @@ mod test {
                 let expected = Schema {
                     tables: vec![Table {
                         name: "t1".to_string(),
-                        fields: HashMap::from([(
+                        fields: OrderedHashMap::from([(
                             "col".to_string(),
                             FieldDef {
                                 name: "col".to_string(),
@@ -611,7 +660,7 @@ mod test {
         let expected = Schema {
             tables: vec![Table {
                 name: "t1".to_string(),
-                fields: HashMap::from([(
+                fields: OrderedHashMap::from([(
                     "col".to_string(),
                     FieldDef {
                         name: "col".to_string(),
@@ -638,14 +687,14 @@ mod test {
         let expected = Query {
             projection: vec![
                 FieldDef {
-                    name: "col_a".to_string(),
-                    sqltype: SqlType::Text,
-                    nullable: true,
-                },
-                FieldDef {
                     name: "id".to_string(),
                     sqltype: SqlType::Int32,
                     nullable: false,
+                },
+                FieldDef {
+                    name: "col_a".to_string(),
+                    sqltype: SqlType::Text,
+                    nullable: true,
                 },
             ],
         };

@@ -61,9 +61,9 @@ export async function getJoined(
 }
 
 export type GetTable1Result = {
+    id: number;
     colA: string | null;
     colB: string;
-    id: number;
 };
 
 export async function getTable1(
