@@ -34,9 +34,15 @@ WHERE email = $email::text;
 Finally, run `sqlgen` to produce typed code:
 
 ```sh
-sqlgen -s ./schema.sql -q ./queries/ > my-queries.ts
+sqlgen typescript -s ./schema.sql -q ./queries/ > my-queries.ts
 # or use the -o flag for an output file
-sqlgen -s ./schema.sql -q ./queries. -o my-queries.ts
+sqlgen typescript -s ./schema.sql -q ./queries. -o my-queries.ts
+```
+
+To see all the CLI options, run:
+
+```sh
+sqlgen --help
 ```
 
 ## Install
@@ -175,7 +181,58 @@ WHERE name = ? AND
 
 ### Languages
 
-Currently, `sqlgen` only outputs TypeScript.
+#### Typescript
+
+`sqlgen typescript` will generate typescript code. It accepts the following arguments:
+
+Name | Required | Description
+--- | --- | ---
+`-s` `--schema` | Yes | The sql schema file to use.
+`-q` `--queries-dir` | Yes | A directory containing sql queries.
+`-o` `--outfile` | No | File to output to - if not provided sqlgen will write output to stdout.
+
+To use the generated code, a `Dispatcher` implementation should be created. You can see the definition fof this interface in the `examples/` directory.
+
+#### Golang
+
+`sqlgen golang` will generate go code. It accepts the following arguments:
+
+Name | Required | Description
+--- | --- | ---
+`-s` `--schema` | Yes | The sql schema file to use.
+`-q` `--queries-dir` | Yes | A directory containing sql queries.
+`-o` `--outfile` | No | File to output to - if not provided sqlgen will write output to stdout. Uses this file to determine the generated package name - if the path is a single file, uses the filename, otherwise uses the first parent directory name. If this arg is not provided, 'queries' will be used as the default package name.
+
+You can use `sqlgen` as a `go generate` directive - the example below assumes we have followed the get started example at the top of this file:
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "log"
+    
+    // generated with the directive below
+    "mypkg/queries"
+)
+
+//go:generate sqlgen golang -s sql/schema.sql -q sql/queries/ -o queries/queries.go
+
+func main() {
+    var db *sql.DB = CreateDBSomehow()
+
+    rows, err := queries.GetAllUserNicknames(db, context.Background())
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    for _, row := range rows {
+        fmt.Println("id: %d; nickname %s", row.Id, row.Nickname)
+    }
+}
+```
 
 ### SQL
 
