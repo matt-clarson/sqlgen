@@ -47,7 +47,13 @@ sqlgen --help
 
 ## Install
 
-For now, the only way to install `sqlgen` is to build it from source. This requires an up-to-date, stable Rust installation:
+### Pre-built binaries
+
+Pre-built binaries are available from GitHub -> https://github.com/matt-clarson/sqlgen/releases.
+
+### Build from source
+
+This requires an up-to-date, stable Rust installation:
 
 ```sh
 # clone the repo
@@ -293,7 +299,7 @@ cargo release commit --execute
 cargo release tag --execute
 
 # use a custom build script to cross-compile for a defined set of target architectures
-./build-releases
+./build-releases.sh
 ```
 
-The output of the `build-releases` script should be published using GitHub Releases
+The output of the `build-releases.sh` script should be published using GitHub Releases
