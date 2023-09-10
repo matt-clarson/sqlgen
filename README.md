@@ -263,3 +263,37 @@ The following SQL is currently understood by the `sqlgen` parser - support for o
 | INSERT statemements (incl. `RETURNING`)                 | ✅        |
 | UPDATE statemements (incl. `RETURNING`)                 | ✅        |
 | DELETE statemements (incl. `RETURNING`)                 | ✅        |
+
+## Development
+
+Tests can be run with Cargo:
+
+```sh
+cargo test
+```
+
+Releases are manual for now. To create a new release, use cargo-release, and cross
+
+Install them like so:
+
+```sh
+cargo install cross cargo-release
+```
+
+Then run the following scripts:
+
+```sh
+# increment the package version - for now only alpha is used as this project is in a pre-release state - eventually any semver increment can be used: major, minor, patch, etc.
+cargo release version alpha --execute
+
+# commit the version bump
+cargo release commit --execute
+
+# tag the latest commit with the new version
+cargo release tag --execute
+
+# use a custom build script to cross-compile for a defined set of target architectures
+./build-releases
+```
+
+The output of the `build-releases` script should be published using GitHub Releases
