@@ -2,13 +2,14 @@ mod argparse;
 mod parse;
 
 use std::{
+    ffi::OsStr,
     fs::{self, DirEntry, ReadDir},
     io::{self, Read},
     path::Path,
 };
 
 use crate::{
-    error::{QueriesError, SqlgenError},
+    error::{FilesError, SqlgenError},
     lang::Codegen,
 };
 
@@ -22,7 +23,7 @@ pub enum SqlDialect {
     Sqlite,
 }
 
-pub type QueriesResult<R> = Result<QueriesEntry<R>, QueriesError>;
+pub type QueriesResult<R> = Result<FilesEntry<R>, FilesError>;
 
 #[derive(Debug)]
 pub struct Sqlgen<R, Q, C>
@@ -31,7 +32,7 @@ where
     Q: Iterator<Item = QueriesResult<R>>,
     C: Codegen,
 {
-    pub schema_file: R,
+    pub schema: String,
     pub queries: Q,
     pub dialect: SqlDialect,
     pub code_generator: C,
@@ -46,9 +47,7 @@ where
     pub fn run(&mut self) -> Result<String, SqlgenError> {
         let parser = Sqlparser::with_dialect(self.dialect);
 
-        let mut schema_sql = String::new();
-        self.schema_file.read_to_string(&mut schema_sql)?;
-        let schema = parser.parse_schema(schema_sql)?;
+        let schema = parser.parse_schema(&self.schema)?;
 
         let mut queries: Vec<NamedQuery> = vec![];
 
@@ -66,7 +65,7 @@ where
             queries.push(query.into_named(entry.name(), &raw_query, args));
         }
 
-        queries.sort_unstable_by(|a,b| a.partial_cmp(b).unwrap());
+        queries.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
         self.code_generator
             .codegen(&queries)
@@ -78,10 +77,10 @@ fn replace<S: AsRef<str>>(sql: S, dialect: SqlDialect, args: &[argparse::Arg]) -
     let s = sql.as_ref();
 
     let mut pos = 0;
-    
+
     let mut out = args.iter().fold(String::new(), |acc, x| {
         let binding = match dialect {
-            SqlDialect::Sqlite => "?"
+            SqlDialect::Sqlite => "?",
         };
 
         let next = acc + &s[pos..x.pos()] + binding;
@@ -96,12 +95,12 @@ fn replace<S: AsRef<str>>(sql: S, dialect: SqlDialect, args: &[argparse::Arg]) -
     out
 }
 
-pub struct QueriesEntry<R: Read> {
-    name: String,
+pub struct FilesEntry<R: Read> {
+    name: Box<str>,
     source: R,
 }
 
-impl<R: Read> QueriesEntry<R> {
+impl<R: Read> FilesEntry<R> {
     pub fn name(&self) -> &str {
         self.name.as_ref()
     }
@@ -111,53 +110,113 @@ impl<R: Read> QueriesEntry<R> {
     }
 }
 
-#[derive(Debug)]
-pub struct Queries {
-    read_dir: ReadDir,
-}
+impl TryFrom<Box<Path>> for FilesEntry<fs::File> {
+    type Error = FilesError;
+    fn try_from(path: Box<Path>) -> Result<Self, Self::Error> {
+        let name = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .ok_or(FilesError::PathError(
+                "cannot get filename from path".to_string(),
+            ))?;
+        let source = fs::File::open(&path)?;
 
-impl Iterator for Queries {
-    type Item = Result<QueriesEntry<fs::File>, QueriesError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(entry) = self.read_dir.next() {
-            if let Some(result) = self.filter_entry(entry).transpose() {
-                return Some(result);
-            }
-        }
-        None
+        Ok(Self {
+            name: name.into(),
+            source,
+        })
     }
 }
 
-impl Queries {
-    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        fs::read_dir(path).map(|read_dir| Queries { read_dir })
-    }
+pub trait FileFilter {
+    fn filter(&self, entry: &DirEntry) -> io::Result<Option<Box<Path>>>;
+}
 
-    /// Result contains `Some` if entry is a sql file, otherwise `None`.
-    fn filter_entry(
-        &self,
-        entry_result: io::Result<DirEntry>,
-    ) -> Result<Option<QueriesEntry<fs::File>>, QueriesError> {
-        let entry = entry_result?;
+pub struct SqlFileFilter {}
+impl FileFilter for SqlFileFilter {
+    fn filter(&self, entry: &DirEntry) -> io::Result<Option<Box<Path>>> {
         let file_type = entry.file_type()?;
         if !file_type.is_file() {
             return Ok(None);
         }
 
         let path = entry.path();
-        let extension = path.extension().and_then(|s| s.to_str());
-        if !matches!(extension, Some("sql")) {
+
+        Ok(path.as_path().to_str().and_then(|s| {
+            if s.ends_with(".sql") {
+                Some(path.as_path().into())
+            } else {
+                None
+            }
+        }))
+    }
+}
+
+pub struct SqlUpFileFilter {}
+impl FileFilter for SqlUpFileFilter {
+    fn filter(&self, entry: &DirEntry) -> io::Result<Option<Box<Path>>> {
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
             return Ok(None);
         }
 
-        let name = path
-            .file_stem()
-            .ok_or_else(|| QueriesError::PathError("cannot get filename from path".to_string()))?
-            .to_string_lossy()
-            .to_string();
-        let source = fs::File::open(path)?;
+        let path = entry.path();
 
-        Ok(Some(QueriesEntry { name, source }))
+        Ok(path.as_path().to_str().and_then(|s| {
+            if s.ends_with(".up.sql") {
+                Some(path.as_path().into())
+            } else {
+                None
+            }
+        }))
+    }
+}
+
+#[derive(Debug)]
+pub struct Files<F: FileFilter> {
+    read_dir: ReadDir,
+    file_filter: F,
+}
+
+impl<F: FileFilter> Iterator for Files<F> {
+    type Item = Result<FilesEntry<fs::File>, FilesError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(entry) = self.read_dir.next() {
+            match entry.and_then(|e| self.file_filter.filter(&e)) {
+                Ok(Some(path)) => return Some(path.try_into()),
+                Ok(None) => continue,
+                Err(err) => return Some(Err(err.into())),
+            };
+        }
+        None
+    }
+}
+
+impl<F: FileFilter> Files<F> {
+    pub fn new<P: AsRef<Path>>(path: P, file_filter: F) -> io::Result<Self> {
+        fs::read_dir(path).map(|read_dir| Files {
+            read_dir,
+            file_filter,
+        })
+    }
+
+    pub fn try_into_string(self) -> Result<String, FilesError> {
+        let mut strings = Vec::<String>::new();
+
+        for file in self {
+            let mut s = String::new();
+            let file = file?;
+            s.push_str("-- ");
+            s.push_str(file.name());
+            s.push('\n');
+            file.source().read_to_string(&mut s)?;
+
+            strings.push(s);
+        }
+
+        strings.sort_unstable();
+
+        Ok(strings.join("\n"))
     }
 }

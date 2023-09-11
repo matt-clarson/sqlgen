@@ -13,4 +13,5 @@ pretty_assertions = "1.4.0"
 
 [dependencies]
 clap = { version = "4.4.1", features = ["derive"] }
+indexmap = "2.0.0"
 sqlparser = "0.37.0"

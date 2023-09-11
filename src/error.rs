@@ -22,7 +22,7 @@ pub enum SqlgenError {
     EntityNotFound(String),
     EmptyQuery,
     CodegenError(CodegenError),
-    QueriesError(QueriesError),
+    QueriesError(FilesError),
     IoError(String),
     Unsupported(String),
     Unknown(String),
@@ -51,8 +51,8 @@ impl From<CodegenError> for SqlgenError {
         Self::CodegenError(err)
     }
 }
-impl From<QueriesError> for SqlgenError {
-    fn from(err: QueriesError) -> Self {
+impl From<FilesError> for SqlgenError {
+    fn from(err: FilesError) -> Self {
         Self::QueriesError(err)
     }
 }
@@ -76,11 +76,11 @@ impl std::fmt::Display for CodegenError {
 impl std::error::Error for CodegenError {}
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum QueriesError {
+pub enum FilesError {
     IoError(String),
     PathError(String),
 }
-impl std::fmt::Display for QueriesError {
+impl std::fmt::Display for FilesError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::IoError(err) => write!(f, "io error: {err}"),
@@ -88,9 +88,14 @@ impl std::fmt::Display for QueriesError {
         }
     }
 }
-impl std::error::Error for QueriesError {}
-impl From<io::Error> for QueriesError {
+impl std::error::Error for FilesError {}
+impl From<io::Error> for FilesError {
     fn from(err: io::Error) -> Self {
         Self::IoError(err.to_string())
+    }
+}
+impl From<FilesError> for io::Error {
+    fn from(value: FilesError) -> Self {
+        Self::new(io::ErrorKind::Other, value.to_string())
     }
 }

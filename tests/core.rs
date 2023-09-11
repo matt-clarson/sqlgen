@@ -2,7 +2,7 @@ use std::{fs, io};
 
 use pretty_assertions::assert_eq;
 use sqlgen::{
-    core::{Queries, SqlDialect},
+    core::{Files, SqlDialect, SqlFileFilter, SqlUpFileFilter},
     Sqlgen,
 };
 
@@ -15,8 +15,8 @@ fn typescript_sqlite_simple() -> io::Result<()> {
     let expected = fs::read_to_string(outputfile).unwrap();
 
     let mut sqlgen = Sqlgen {
-        schema_file: fs::File::open(schemafile)?,
-        queries: Queries::new(queriesdir)?,
+        schema: fs::read_to_string(schemafile)?,
+        queries: Files::new(queriesdir, SqlFileFilter {})?,
         code_generator: sqlgen::lang::typescript::TSCodegen {},
         dialect: SqlDialect::Sqlite,
     };
@@ -37,8 +37,52 @@ fn golang_sqlite_simple() -> io::Result<()> {
     let expected = fs::read_to_string(outputfile).unwrap();
 
     let mut sqlgen = Sqlgen {
-        schema_file: fs::File::open(schemafile)?,
-        queries: Queries::new(queriesdir)?,
+        schema: fs::read_to_string(schemafile)?,
+        queries: Files::new(queriesdir, SqlFileFilter {})?,
+        code_generator: sqlgen::lang::golang::GoCodegen::default(),
+        dialect: SqlDialect::Sqlite,
+    };
+
+    let actual = sqlgen.run().unwrap();
+
+    assert_eq!(actual, expected);
+
+    Ok(())
+}
+
+#[test]
+fn typescript_sqlite_migration() -> io::Result<()> {
+    let migration_dir = "examples/sqlite/migration/migrations";
+    let queriesdir = "examples/sqlite/migration/queries";
+    let outputfile = "examples/sqlite/migration/typescript/queries.ts";
+
+    let expected = fs::read_to_string(outputfile).unwrap();
+
+    let mut sqlgen = Sqlgen {
+        schema: Files::new(migration_dir, SqlUpFileFilter {})?.try_into_string()?,
+        queries: Files::new(queriesdir, SqlFileFilter {})?,
+        code_generator: sqlgen::lang::typescript::TSCodegen {},
+        dialect: SqlDialect::Sqlite,
+    };
+
+    let actual = sqlgen.run().unwrap();
+
+    assert_eq!(actual, expected);
+
+    Ok(())
+}
+
+#[test]
+fn golang_sqlite_migration() -> io::Result<()> {
+    let migration_dir = "examples/sqlite/migration/migrations";
+    let queriesdir = "examples/sqlite/migration/queries";
+    let outputfile = "examples/sqlite/migration/golang/queries.go";
+
+    let expected = fs::read_to_string(outputfile).unwrap();
+
+    let mut sqlgen = Sqlgen {
+        schema: Files::new(migration_dir, SqlUpFileFilter {})?.try_into_string()?,
+        queries: Files::new(queriesdir, SqlFileFilter {})?,
         code_generator: sqlgen::lang::golang::GoCodegen::default(),
         dialect: SqlDialect::Sqlite,
     };

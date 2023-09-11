@@ -3,7 +3,7 @@ use crate::{
     error::CodegenError,
 };
 
-use super::{Codegen, camel_case, indent_lines, pascal_case};
+use super::{camel_case, indent_lines, pascal_case, Codegen};
 
 pub struct TSCodegen {}
 
@@ -181,4 +181,3 @@ impl SqlTypeExt for SqlType {
         }
     }
 }
-

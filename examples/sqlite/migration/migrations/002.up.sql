@@ -1,0 +1,3 @@
+ALTER TABLE items
+ADD COLUMN rating INT;
+

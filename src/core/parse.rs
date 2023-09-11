@@ -1,7 +1,11 @@
-use std::{borrow::Borrow, collections::HashMap, fmt::Display, hash::Hash};
+use std::{borrow::Borrow, collections::HashMap, fmt::Display};
 
+use indexmap::IndexMap;
 use sqlparser::{
-    ast::{self, Expr, ObjectName, SelectItem, SetExpr, Statement, TableFactor},
+    ast::{
+        self, AlterTableOperation, ColumnDef, DataType, Expr, ObjectName, SelectItem, SetExpr,
+        Statement, TableFactor,
+    },
     dialect,
     parser::Parser,
 };
@@ -52,13 +56,13 @@ impl PartialOrd for NamedQuery {
 
 #[derive(Debug, PartialEq)]
 pub struct Schema {
-    tables: Vec<Table>,
+    tables: HashMap<String, Table>,
 }
 
 impl Schema {
     pub fn get_table<S: AsRef<str>>(&self, name: S) -> Option<&Table> {
         self.tables
-            .iter()
+            .values()
             .find(|&table| table.name.as_str() == name.as_ref())
     }
 }
@@ -66,7 +70,7 @@ impl Schema {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Table {
     name: String,
-    fields: OrderedHashMap<String, FieldDef>,
+    fields: IndexMap<String, FieldDef>,
 }
 
 impl PartialOrd for Table {
@@ -79,7 +83,7 @@ impl Table {
     pub fn new(name: String) -> Self {
         Self {
             name,
-            fields: OrderedHashMap::new(),
+            fields: IndexMap::new(),
         }
     }
 
@@ -93,6 +97,21 @@ impl Table {
 
     pub fn find_field<S: AsRef<str>>(&self, name: S) -> Option<&FieldDef> {
         self.fields.get(name.as_ref())
+    }
+
+    pub fn rename_field<S: AsRef<str>, D: Display>(
+        &mut self,
+        old_name: S,
+        new_name: D,
+    ) -> Option<FieldDef> {
+        let field = self.fields.get(old_name.as_ref())?;
+        let renamed = field.clone_with_alias(&new_name);
+        self.fields.insert(new_name.to_string(), renamed);
+        self.fields.swap_remove(old_name.as_ref())
+    }
+
+    pub fn delete_field<S: AsRef<str>>(&mut self, name: S) -> Option<FieldDef> {
+        self.fields.shift_remove(name.as_ref())
     }
 }
 
@@ -182,12 +201,78 @@ impl Sqlparser {
     pub fn parse_schema<S: AsRef<str>>(&self, sql: S) -> Result<Schema, SqlgenError> {
         let statements = self.parse_to_statements(sql)?;
 
-        let mut schema = Schema { tables: vec![] };
+        let mut schema = Schema {
+            tables: HashMap::new(),
+        };
 
         for stmt in statements {
-            if let Some(table) = self.statement_to_table(&stmt).unwrap() {
-                schema.tables.push(table);
-            }
+            match stmt {
+                Statement::CreateTable { name, columns, .. } => {
+                    let table_name = name.0.last().unwrap().to_string();
+                    let mut table = Table::new(table_name.clone());
+                    for coldef in &columns {
+                        let field: FieldDef = coldef.try_into()?;
+                        table.insert_field(field.name.clone(), field);
+                    }
+                    schema.tables.insert(table_name, table);
+                }
+                Statement::AlterTable {
+                    name,
+                    operation: AlterTableOperation::AddColumn { column_def, .. },
+                } => {
+                    let table_name = name.0.last().unwrap().to_string();
+                    if let Some(table) = schema.tables.get_mut(&table_name) {
+                        let new_field = FieldDef::try_from(&column_def)?;
+                        table.insert_field(new_field.name().to_string(), new_field)
+                    } else {
+                        return Err(SqlgenError::EntityNotFound(format!(
+                            "can't find definition for table {table_name}"
+                        )));
+                    }
+                }
+                Statement::AlterTable {
+                    name,
+                    operation:
+                        AlterTableOperation::RenameColumn {
+                            old_column_name,
+                            new_column_name,
+                        },
+                } => {
+                    let table_name = name.0.last().unwrap().to_string();
+                    if let Some(table) = schema.tables.get_mut(&table_name) {
+                        if table
+                            .rename_field(old_column_name.to_string(), new_column_name)
+                            .is_none()
+                        {
+                            return Err(SqlgenError::EntityNotFound(format!(
+                                "can't find column to rename {old_column_name}"
+                            )));
+                        }
+                    } else {
+                        return Err(SqlgenError::EntityNotFound(format!(
+                            "can't find definition for table {table_name}"
+                        )));
+                    }
+                }
+                Statement::AlterTable {
+                    name,
+                    operation: AlterTableOperation::DropColumn { column_name, .. },
+                } => {
+                    let table_name = name.0.last().unwrap().to_string();
+                    if let Some(table) = schema.tables.get_mut(&table_name) {
+                        if table.delete_field(column_name.to_string()).is_none() {
+                            return Err(SqlgenError::EntityNotFound(format!(
+                                "can't find column to remove {column_name}"
+                            )));
+                        }
+                    } else {
+                        return Err(SqlgenError::EntityNotFound(format!(
+                            "can't find definition for table {table_name}"
+                        )));
+                    }
+                }
+                _ => {}
+            };
         }
 
         Ok(schema)
@@ -312,117 +397,65 @@ impl Sqlparser {
             .and_then(|mut p| p.parse_statements())
             .map_err(|e| e.into())
     }
+}
 
-    fn statement_to_table(
-        &self,
-        stmt: &Statement,
-    ) -> Result<Option<Table>, crate::error::SqlgenError> {
-        match stmt {
-            sqlparser::ast::Statement::CreateTable { name, columns, .. } => {
-                let table_name = name.0.last().unwrap().to_string();
-                let mut table = Table::new(table_name);
-                for coldef in columns {
-                    let field_name = coldef.name.to_string();
-                    let sqltype = match &coldef.data_type {
-                        ast::DataType::Bool | ast::DataType::Boolean => SqlType::Bool,
-                        ast::DataType::TinyInt(_) => SqlType::Int8,
-                        ast::DataType::SmallInt(_) | ast::DataType::Int2(_) => SqlType::Int16,
-                        ast::DataType::Int4(_)
-                        | ast::DataType::Integer(_)
-                        | ast::DataType::MediumInt(_)
-                        | ast::DataType::Int(_) => SqlType::Int32,
-                        ast::DataType::BigInt(_) | ast::DataType::Int8(_) => SqlType::Int64,
-                        ast::DataType::Text => SqlType::Text,
-                        ast::DataType::Real | ast::DataType::Float4 => SqlType::Float32,
-                        ast::DataType::Float(_)
-                        | ast::DataType::Float8
-                        | ast::DataType::Double
-                        | ast::DataType::DoublePrecision => SqlType::Float64,
-                        ast::DataType::Blob(_) => SqlType::Binary,
-                        data_type => {
-                            return Err(SqlgenError::Unsupported(format!(
-                                "data type {data_type} is not supported"
-                            )))
-                        }
-                    };
-                    let not_null = coldef.options.iter().any(|opt| {
-                        matches!(
-                            opt.option,
-                            ast::ColumnOption::NotNull
-                                | ast::ColumnOption::Unique { is_primary: true }
-                        )
-                    });
-                    let field = FieldDef {
-                        name: field_name.clone(),
-                        sqltype,
-                        nullable: !not_null,
-                    };
-                    table.insert_field(field_name, field);
-                }
-                Ok(Some(table))
-            }
-            _ => Ok(None),
-        }
+impl TryFrom<&ColumnDef> for FieldDef {
+    type Error = SqlgenError;
+
+    fn try_from(coldef: &ColumnDef) -> Result<Self, Self::Error> {
+        let field_name = coldef.name.to_string();
+        let sqltype = SqlType::try_from(&coldef.data_type)?;
+        let not_null = coldef.options.iter().any(|opt| {
+            matches!(
+                opt.option,
+                ast::ColumnOption::NotNull | ast::ColumnOption::Unique { is_primary: true }
+            )
+        });
+        Ok(FieldDef {
+            name: field_name.clone(),
+            sqltype,
+            nullable: !not_null,
+        })
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct OrderedHashMap<K: Clone + Eq + PartialEq + Hash, V> {
-    hash_map: HashMap<K, V>,
-    ordered_keys: Vec<K>,
-}
+impl TryFrom<&DataType> for SqlType {
+    type Error = SqlgenError;
 
-impl<K: Clone + Eq + PartialEq + Hash, V> OrderedHashMap<K, V> {
-    pub fn new() -> Self {
-        Self {
-            hash_map: HashMap::new(),
-            ordered_keys: Vec::new(),
+    fn try_from(value: &DataType) -> Result<Self, Self::Error> {
+        match value {
+            ast::DataType::Bool | ast::DataType::Boolean => Ok(SqlType::Bool),
+            ast::DataType::TinyInt(_) => Ok(SqlType::Int8),
+            ast::DataType::SmallInt(_) | ast::DataType::Int2(_) => Ok(SqlType::Int16),
+            ast::DataType::Int4(_)
+            | ast::DataType::Integer(_)
+            | ast::DataType::MediumInt(_)
+            | ast::DataType::Int(_) => Ok(SqlType::Int32),
+            ast::DataType::BigInt(_) | ast::DataType::Int8(_) => Ok(SqlType::Int64),
+            ast::DataType::Text => Ok(SqlType::Text),
+            ast::DataType::Real | ast::DataType::Float4 => Ok(SqlType::Float32),
+            ast::DataType::Float(_)
+            | ast::DataType::Float8
+            | ast::DataType::Double
+            | ast::DataType::DoublePrecision => Ok(SqlType::Float64),
+            ast::DataType::Blob(_) => Ok(SqlType::Binary),
+            data_type => Err(SqlgenError::Unsupported(format!(
+                "data type {data_type} is not supported"
+            ))),
         }
-    }
-
-    pub fn insert(&mut self, k: K, v: V) {
-        self.hash_map.insert(k.clone(), v);
-        self.ordered_keys.push(k);
-    }
-
-    pub fn get<Q>(&self, k: &Q) -> Option<&V>
-        where
-            Q: ?Sized,
-            K: Borrow<Q>,
-            Q: Eq + Hash
-    {
-        self.hash_map.get(k)
-    }
-
-    pub fn values<'a>(&'a self) -> Box<dyn Iterator<Item = &V> + 'a> {
-        let iter = self
-            .ordered_keys
-            .iter()
-            .map(|k| unsafe { self.hash_map.get(k).unwrap_unchecked() });
-        Box::new(iter)
-    }
-}
-
-impl <K: Clone + Eq + PartialEq + Hash, V, const N: usize> From<[(K, V); N]> for OrderedHashMap<K, V> {
-    fn from(pairs: [(K, V); N]) -> Self {
-        let mut hash_map = Self::new();
-        for (k, v) in pairs {
-            hash_map.insert(k, v);
-        }
-        hash_map
     }
 }
 
 struct QueryTables<'a> {
     schema: &'a Schema,
-    tables: OrderedHashMap<String, Table>,
+    tables: IndexMap<String, Table>,
 }
 
 impl<'a> QueryTables<'a> {
     fn new(schema: &'a Schema) -> Self {
         Self {
             schema,
-            tables: OrderedHashMap::new(),
+            tables: IndexMap::new(),
         }
     }
 
@@ -581,10 +614,13 @@ mod test {
     #[test]
     fn parse_empty_table() {
         let expected = Schema {
-            tables: vec![Table {
-                name: "empty".to_string(),
-                fields: OrderedHashMap::new(),
-            }],
+            tables: HashMap::from([(
+                "empty".to_string(),
+                Table {
+                    name: "empty".to_string(),
+                    fields: IndexMap::new(),
+                },
+            )]),
         };
 
         let parser = Sqlparser {
@@ -601,17 +637,20 @@ mod test {
             #[test]
             fn $test_fn() {
                 let expected = Schema {
-                    tables: vec![Table {
-                        name: "t1".to_string(),
-                        fields: OrderedHashMap::from([(
-                            "col".to_string(),
-                            FieldDef {
-                                name: "col".to_string(),
-                                sqltype: $sql_type,
-                                nullable: true,
-                            },
-                        )]),
-                    }],
+                    tables: HashMap::from([(
+                        "t1".to_string(),
+                        Table {
+                            name: "t1".to_string(),
+                            fields: IndexMap::from([(
+                                "col".to_string(),
+                                FieldDef {
+                                    name: "col".to_string(),
+                                    sqltype: $sql_type,
+                                    nullable: true,
+                                },
+                            )]),
+                        },
+                    )]),
                 };
 
                 let parser = Sqlparser {
@@ -658,17 +697,20 @@ mod test {
     #[test]
     fn parse_table_primary_key() {
         let expected = Schema {
-            tables: vec![Table {
-                name: "t1".to_string(),
-                fields: OrderedHashMap::from([(
-                    "col".to_string(),
-                    FieldDef {
-                        name: "col".to_string(),
-                        sqltype: SqlType::Int32,
-                        nullable: false,
-                    },
-                )]),
-            }],
+            tables: HashMap::from([(
+                "t1".to_string(),
+                Table {
+                    name: "t1".to_string(),
+                    fields: IndexMap::from([(
+                        "col".to_string(),
+                        FieldDef {
+                            name: "col".to_string(),
+                            sqltype: SqlType::Int32,
+                            nullable: false,
+                        },
+                    )]),
+                },
+            )]),
         };
 
         let parser = Sqlparser {
@@ -677,6 +719,134 @@ mod test {
 
         let actual = parser
             .parse_schema("CREATE TABLE t1(col INT PRIMARY KEY);")
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_alter_table_add_column() {
+        let expected = Schema {
+            tables: HashMap::from([(
+                "t1".to_string(),
+                Table {
+                    name: "t1".to_string(),
+                    fields: IndexMap::from([
+                        (
+                            "col".to_string(),
+                            FieldDef {
+                                name: "col".to_string(),
+                                sqltype: SqlType::Int32,
+                                nullable: false,
+                            },
+                        ),
+                        (
+                            "new_col".to_string(),
+                            FieldDef {
+                                name: "new_col".to_string(),
+                                sqltype: SqlType::Float64,
+                                nullable: true,
+                            },
+                        ),
+                    ]),
+                },
+            )]),
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let actual = parser
+            .parse_schema(
+                r#"
+                CREATE TABLE t1(col INT PRIMARY KEY);
+                ALTER TABLE t1
+                ADD COLUMN new_col DOUBLE;
+            "#,
+            )
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_alter_table_rename_column() {
+        let expected = Schema {
+            tables: HashMap::from([(
+                "t1".to_string(),
+                Table {
+                    name: "t1".to_string(),
+                    fields: IndexMap::from([
+                        (
+                            "renamed".to_string(),
+                            FieldDef {
+                                name: "renamed".to_string(),
+                                sqltype: SqlType::Int32,
+                                nullable: false,
+                            },
+                        ),
+                        (
+                            "other".to_string(),
+                            FieldDef {
+                                name: "other".to_string(),
+                                sqltype: SqlType::Text,
+                                nullable: true,
+                            },
+                        ),
+                    ]),
+                },
+            )]),
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let actual = parser
+            .parse_schema(
+                r#"
+                CREATE TABLE t1(col INT PRIMARY KEY, other TEXT);
+                ALTER TABLE t1
+                RENAME COLUMN col TO renamed;
+            "#,
+            )
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_alter_table_drop_column() {
+        let expected = Schema {
+            tables: HashMap::from([(
+                "t1".to_string(),
+                Table {
+                    name: "t1".to_string(),
+                    fields: IndexMap::from([(
+                        "col".to_string(),
+                        FieldDef {
+                            name: "col".to_string(),
+                            sqltype: SqlType::Int32,
+                            nullable: false,
+                        },
+                    )]),
+                },
+            )]),
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let actual = parser
+            .parse_schema(
+                r#"
+                CREATE TABLE t1(col INT PRIMARY KEY, other TEXT);
+                ALTER TABLE t1
+                DROP COLUMN other;
+            "#,
+            )
             .unwrap();
 
         assert_eq!(expected, actual);

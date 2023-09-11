@@ -6,7 +6,7 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlgen::{
-    core::{Queries, SqlDialect},
+    core::{Files, SqlDialect, SqlFileFilter, SqlUpFileFilter},
     lang::{golang::GoCodegen, typescript::TSCodegen},
     Sqlgen,
 };
@@ -29,9 +29,15 @@ struct Cli {
 enum Command {
     /// Generate go code for the given schema and queries.
     Golang {
-        /// The sql schema file to use.
+        /// The sql schema file to use. Either this option OR --migration_dir must be provided.
         #[arg(short, long, value_name = "FILE")]
-        schema: PathBuf,
+        schema: Option<PathBuf>,
+
+        /// The migrations dir to use, will sort files named <file>.up.sql in ascending order, and
+        /// use them to determine the database schema to use. Either this option OR --schema must
+        /// be provided.
+        #[arg(short, long, value_name = "DIR")]
+        migration_dir: Option<PathBuf>,
 
         /// A directory containing sql queries.
         #[arg(short, long, value_name = "DIR")]
@@ -52,9 +58,15 @@ enum Command {
     },
     /// Generate typescript code for the given schema and queries.
     Typescript {
-        /// The sql schema file to use.
+        /// The sql schema file to use. Either this option OR --migration_dir must be provided.
         #[arg(short, long, value_name = "FILE")]
-        schema: PathBuf,
+        schema: Option<PathBuf>,
+
+        /// The migrations dir to use, will sort files named <file>.up.sql in ascending order, and
+        /// use them to determine the database schema to use. Either this option OR --schema must
+        /// be provided.
+        #[arg(short, long, value_name = "DIR")]
+        migration_dir: Option<PathBuf>,
 
         /// A directory containing sql queries.
         #[arg(short, long, value_name = "DIR")]
@@ -72,11 +84,12 @@ fn main() -> io::Result<()> {
     match cli.command {
         Command::Golang {
             schema,
+            migration_dir,
             queries_dir,
             outfile,
         } => {
-            let schema_file = fs::File::open(schema)?;
-            let queries = Queries::new(queries_dir)?;
+            let schema = load_schema(schema, migration_dir)?;
+            let queries = Files::new(queries_dir, SqlFileFilter {})?;
             let dialect = SqlDialect::Sqlite;
 
             let mut out: Box<dyn io::Write> = match &outfile {
@@ -93,7 +106,7 @@ fn main() -> io::Result<()> {
                 None => GoCodegen::default(),
             };
             let mut sqlgen = Sqlgen {
-                schema_file,
+                schema,
                 queries,
                 code_generator,
                 dialect,
@@ -108,11 +121,13 @@ fn main() -> io::Result<()> {
         }
         Command::Typescript {
             schema,
+            migration_dir,
             queries_dir,
             outfile,
+            ..
         } => {
-            let schema_file = fs::File::open(schema)?;
-            let queries = Queries::new(queries_dir)?;
+            let schema = load_schema(schema, migration_dir)?;
+            let queries = Files::new(queries_dir, SqlFileFilter {})?;
             let dialect = SqlDialect::Sqlite;
 
             let mut out: Box<dyn io::Write> = match outfile {
@@ -125,7 +140,7 @@ fn main() -> io::Result<()> {
                 None => Box::new(io::stdout()),
             };
             let mut sqlgen = Sqlgen {
-                schema_file,
+                schema,
                 queries,
                 code_generator: TSCodegen {},
                 dialect,
@@ -138,5 +153,21 @@ fn main() -> io::Result<()> {
                 }
             }
         }
+    }
+}
+
+fn load_schema(schema_file: Option<PathBuf>, migration_dir: Option<PathBuf>) -> io::Result<String> {
+    if let Some(path) = schema_file {
+        return fs::read_to_string(path);
+    }
+
+    if let Some(path) = migration_dir {
+        let files = Files::new(path, SqlUpFileFilter {})?;
+        files.try_into_string().map_err(|e| e.into())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "one of --schema or --migration-dir is required",
+        ))
     }
 }
