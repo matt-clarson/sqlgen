@@ -193,7 +193,8 @@ WHERE name = ? AND
 
 Name | Required | Description
 --- | --- | ---
-`-s` `--schema` | Yes | The sql schema file to use.
+`-s` `--schema` | No | The sql schema file to use. One of `--schema` or `--migration-dir` must be provided.
+`-m` `--migration-dir` | No | A directory of migration files to use. Only files ending in `.up.sql` will be used, and files will be read in ascending alphanumeric order. One of `--schema` or `--migration-dir` must be provided.
 `-q` `--queries-dir` | Yes | A directory containing sql queries.
 `-o` `--outfile` | No | File to output to - if not provided sqlgen will write output to stdout.
 
@@ -205,7 +206,8 @@ To use the generated code, a `Dispatcher` implementation should be created. You 
 
 Name | Required | Description
 --- | --- | ---
-`-s` `--schema` | Yes | The sql schema file to use.
+`-s` `--schema` | No | The sql schema file to use. One of `--schema` or `--migration-dir` must be provided.
+`-m` `--migration-dir` | No | A directory of migration files to use. Only files ending in `.up.sql` will be used, and files will be read in ascending alphanumeric order. One of `--schema` or `--migration-dir` must be provided.
 `-q` `--queries-dir` | Yes | A directory containing sql queries.
 `-o` `--outfile` | No | File to output to - if not provided sqlgen will write output to stdout. Uses this file to determine the generated package name - if the path is a single file, uses the filename, otherwise uses the first parent directory name. If this arg is not provided, 'queries' will be used as the default package name.
 
