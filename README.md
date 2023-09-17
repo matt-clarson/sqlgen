@@ -143,7 +143,7 @@ The output type will be:
 Specifically, an argument is defined as follows:
 
 ```ebnf
-arg = "$" ident "::" type
+arg = "$" ident "::" [ "?" ] type
 ident = alpha { alphanum }
 alphanum = alpha | "0" | "1" | "2" | "3" | "4" | "5" | "8" | "9";
 type = "tinyint" | "smallint" | "int" | "bigint"
@@ -185,18 +185,36 @@ WHERE name = ? AND
       col_a > ?;
 ```
 
+You can include a `?` character to denote an optional argument - these will be converted into a null-like value for the target language:
+
+```sql
+$myarg::?int
+```
+
+becomes:
+
+```typescript
+// in typescript
+let myarg: number | null;
+```
+
+```golang
+// in go
+var myarg sql.NullInt32
+```
+
 ### Languages
 
 #### Typescript
 
 `sqlgen typescript` will generate typescript code. It accepts the following arguments:
 
-Name | Required | Description
---- | --- | ---
-`-s` `--schema` | No | The sql schema file to use. One of `--schema` or `--migration-dir` must be provided.
-`-m` `--migration-dir` | No | A directory of migration files to use. Only files ending in `.up.sql` will be used, and files will be read in ascending alphanumeric order. One of `--schema` or `--migration-dir` must be provided.
-`-q` `--queries-dir` | Yes | A directory containing sql queries.
-`-o` `--outfile` | No | File to output to - if not provided sqlgen will write output to stdout.
+| Name                   | Required | Description                                                                                                                                                                                          |
+| ---------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-s` `--schema`        | No       | The sql schema file to use. One of `--schema` or `--migration-dir` must be provided.                                                                                                                 |
+| `-m` `--migration-dir` | No       | A directory of migration files to use. Only files ending in `.up.sql` will be used, and files will be read in ascending alphanumeric order. One of `--schema` or `--migration-dir` must be provided. |
+| `-q` `--queries-dir`   | Yes      | A directory containing sql queries.                                                                                                                                                                  |
+| `-o` `--outfile`       | No       | File to output to - if not provided sqlgen will write output to stdout.                                                                                                                              |
 
 To use the generated code, a `Dispatcher` implementation should be created. You can see the definition fof this interface in the `examples/` directory.
 
@@ -204,12 +222,12 @@ To use the generated code, a `Dispatcher` implementation should be created. You 
 
 `sqlgen golang` will generate go code. It accepts the following arguments:
 
-Name | Required | Description
---- | --- | ---
-`-s` `--schema` | No | The sql schema file to use. One of `--schema` or `--migration-dir` must be provided.
-`-m` `--migration-dir` | No | A directory of migration files to use. Only files ending in `.up.sql` will be used, and files will be read in ascending alphanumeric order. One of `--schema` or `--migration-dir` must be provided.
-`-q` `--queries-dir` | Yes | A directory containing sql queries.
-`-o` `--outfile` | No | File to output to - if not provided sqlgen will write output to stdout. Uses this file to determine the generated package name - if the path is a single file, uses the filename, otherwise uses the first parent directory name. If this arg is not provided, 'queries' will be used as the default package name.
+| Name                   | Required | Description                                                                                                                                                                                                                                                                                                        |
+| ---------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `-s` `--schema`        | No       | The sql schema file to use. One of `--schema` or `--migration-dir` must be provided.                                                                                                                                                                                                                               |
+| `-m` `--migration-dir` | No       | A directory of migration files to use. Only files ending in `.up.sql` will be used, and files will be read in ascending alphanumeric order. One of `--schema` or `--migration-dir` must be provided.                                                                                                               |
+| `-q` `--queries-dir`   | Yes      | A directory containing sql queries.                                                                                                                                                                                                                                                                                |
+| `-o` `--outfile`       | No       | File to output to - if not provided sqlgen will write output to stdout. Uses this file to determine the generated package name - if the path is a single file, uses the filename, otherwise uses the first parent directory name. If this arg is not provided, 'queries' will be used as the default package name. |
 
 You can use `sqlgen` as a `go generate` directive - the example below assumes we have followed the get started example at the top of this file:
 
@@ -221,7 +239,7 @@ import (
     "database/sql"
     "fmt"
     "log"
-    
+
     // generated with the directive below
     "mypkg/queries"
 )

@@ -79,7 +79,7 @@ export async function getTable1(
 
 export type InsertTable1Arg = {
     id: number;
-    colA: string;
+    colA: string | null;
     colB: string;
 };
 

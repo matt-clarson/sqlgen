@@ -56,11 +56,11 @@ where
             let mut query_sql = String::new();
             entry.source.read_to_string(&mut query_sql)?;
 
-            let query = parser.parse_query(&query_sql, &schema)?;
-
             let args = argparse::args(&query_sql);
 
             let raw_query = replace(&query_sql, self.dialect, &args);
+
+            let query = parser.parse_query(&raw_query, &schema)?;
 
             queries.push(query.into_named(entry.name(), &raw_query, args));
         }

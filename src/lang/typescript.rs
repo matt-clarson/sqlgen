@@ -75,6 +75,9 @@ impl TSCodegen {
             s.push_str(camel_case(arg.ident()).as_str());
             s.push_str(": ");
             s.push_str(arg.sql_type().into_str());
+            if arg.nullable() {
+                s.push_str(" | null");
+            }
             s.push_str(";\n");
         }
         s.push_str("};\n\n");

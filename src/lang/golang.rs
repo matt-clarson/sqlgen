@@ -109,7 +109,11 @@ impl GoCodegen {
             for _ in 0..padding {
                 s.push(' ');
             }
-            s.push_str(arg.sql_type().into_strict_str());
+            if arg.nullable() {
+                s.push_str(arg.sql_type().into_null_str());
+            } else {
+                s.push_str(arg.sql_type().into_strict_str());
+            }
             s.push('\n');
         }
         s.push_str("}\n\n");

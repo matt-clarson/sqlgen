@@ -97,7 +97,7 @@ func GetTable1(db *sql.DB, ctx context.Context) ([]GetTable1Result, error) {
 
 type InsertTable1Arg struct {
 	Id   int32
-	ColA string
+	ColA sql.NullString
 	ColB string
 }
 
