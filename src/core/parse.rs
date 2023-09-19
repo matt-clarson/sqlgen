@@ -3,8 +3,8 @@ use std::{borrow::Borrow, collections::HashMap, fmt::Display};
 use indexmap::IndexMap;
 use sqlparser::{
     ast::{
-        self, AlterTableOperation, ColumnDef, DataType, Expr, ObjectName, SelectItem, SetExpr,
-        Statement, TableFactor,
+        self, AlterTableOperation, ColumnDef, DataType, Expr, Function, FunctionArg,
+        FunctionArgExpr, ObjectName, SelectItem, SetExpr, Statement, TableFactor,
     },
     dialect,
     parser::Parser,
@@ -558,6 +558,16 @@ impl<'a> QueryTables<'a> {
                     Err(SqlgenError::EntityNotFound(compound_name(idents)))
                 }
             }
+            SelectItem::UnnamedExpr(Expr::Function(func)) => {
+                if let Some(field) = self.builtin_func_to_field(func) {
+                    Ok(Box::new(Singleton::from(field?)))
+                } else {
+                    Err(SqlgenError::Unsupported(format!(
+                        "function {} is not supported",
+                        func.name
+                    )))
+                }
+            }
             SelectItem::ExprWithAlias {
                 expr: Expr::Identifier(ident),
                 alias,
@@ -578,9 +588,113 @@ impl<'a> QueryTables<'a> {
                     Err(SqlgenError::EntityNotFound(compound_name(idents)))
                 }
             }
+            SelectItem::ExprWithAlias {
+                expr: Expr::Function(func),
+                alias,
+            } => {
+                if let Some(field) = self.builtin_func_to_field(func) {
+                    Ok(Box::new(Singleton::from(field?.clone_with_alias(alias))))
+                } else {
+                    Err(SqlgenError::Unsupported(format!(
+                        "function {} is not supported",
+                        func.name
+                    )))
+                }
+            }
             c => Err(SqlgenError::Unsupported(format!(
                 "got unsupported select projection: {c:?}",
             ))),
+        }
+    }
+
+    fn builtin_func_to_field(&self, func: &Function) -> Option<Result<FieldDef, SqlgenError>> {
+        let name = func.name.to_string();
+        match name.to_lowercase().as_str() {
+            "avg" => Some(Ok(FieldDef {
+                name,
+                sqltype: SqlType::Float64,
+                nullable: true,
+            })),
+            "count" => Some(Ok(FieldDef {
+                name,
+                sqltype: SqlType::Int32,
+                nullable: false,
+            })),
+            "group_concat" => Some(Ok(FieldDef {
+                name,
+                sqltype: SqlType::Text,
+                nullable: false,
+            })),
+            "total" => Some(Ok(FieldDef {
+                name,
+                sqltype: SqlType::Float64,
+                nullable: false,
+            })),
+            "max" | "min" => match func.args.first() {
+                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident)))) => {
+                    if let Some(field) = self.find_field(&ident.value) {
+                        Some(Ok(FieldDef {
+                            name,
+                            sqltype: field.sqltype(),
+                            nullable: false,
+                        }))
+                    } else {
+                        Some(Err(SqlgenError::EntityNotFound(ident.to_string())))
+                    }
+                }
+                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(
+                    idents,
+                )))) => {
+                    if let Some(field) = self.find_qualified_field(idents) {
+                        Some(Ok(FieldDef {
+                            name,
+                            sqltype: field.sqltype(),
+                            nullable: false,
+                        }))
+                    } else {
+                        Some(Err(SqlgenError::EntityNotFound(compound_name(idents))))
+                    }
+                }
+                _ => Some(Err(SqlgenError::Unknown(
+                    format!("{name} function called with invalid args - expected a single column identifier"),
+                ))),
+            },
+            "sum" => match func.args.first() {
+                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident)))) => {
+                    if let Some(field) = self.find_field(&ident.value) {
+                        Some(Ok(FieldDef {
+                            name,
+                            sqltype: match field.sqltype() {
+                                SqlType::Int8 | SqlType::Int16 | SqlType::Int32 | SqlType::Int64 => field.sqltype(),
+                                _ => SqlType::Float64
+                            },
+                            nullable: true,
+                        }))
+                    } else {
+                        Some(Err(SqlgenError::EntityNotFound(ident.to_string())))
+                    }
+                }
+                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(
+                    idents,
+                )))) => {
+                    if let Some(field) = self.find_qualified_field(idents) {
+                        Some(Ok(FieldDef {
+                            name,
+                            sqltype: match field.sqltype() {
+                                SqlType::Int8 | SqlType::Int16 | SqlType::Int32 | SqlType::Int64 => field.sqltype(),
+                                _ => SqlType::Float64
+                            },
+                            nullable: true,
+                        }))
+                    } else {
+                        Some(Err(SqlgenError::EntityNotFound(compound_name(idents))))
+                    }
+                }
+                _ => Some(Err(SqlgenError::Unknown(
+                    format!("{name} function called with invalid args - expected a single column identifier"),
+                ))),
+            },
+            _ => None,
         }
     }
 }
@@ -1250,6 +1364,362 @@ mod test {
             .unwrap();
         let actual = parser
             .parse_query("UPDATE t1 SET col_a = 3 RETURNING col_a;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_avg() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "avg".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT avg(a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_avg_aliased() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "some_name".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT avg(a) AS some_name FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_count() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "count".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT count(a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_group_concat() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "group_concat".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT group_concat(a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_max_int() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "max".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT max(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_max_text() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "max".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT max(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_max_compound() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "max".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT max(t1.col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_min_int() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "min".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT min(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_min_text() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "min".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT min(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_min_compound() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "min".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT min(t1.col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_sum_int() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "sum".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT sum(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_sum_float() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "sum".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a FLOAT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT sum(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_sum_text() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "sum".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT sum(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_total_int() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "total".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT total(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_total_float() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "total".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a FLOAT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT total(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_total_text() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "total".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT total(col_a) FROM t1;", &schema)
             .unwrap();
 
         assert_eq!(expected, actual);

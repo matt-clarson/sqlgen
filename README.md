@@ -283,7 +283,7 @@ The following SQL is currently understood by the `sqlgen` parser - support for o
 | JOINs                                                   | ✅        |
 | CTEs                                                    | ❌        |
 | Subqueries                                              | ❌        |
-| Aggregate Functions (`count()`, `avg()`, etc.)          | ❌        |
+| Aggregate Functions (`count()`, `avg()`, etc.)          | ✅        |
 | Scalar Functions (`coalesce()`, `substr()`, etc.)       | ❌        |
 | Casting (`CAST('1' AS INT)`, or `'1'::int` in Postgres) | ❌        |
 | INSERT statemements (incl. `RETURNING`)                 | ✅        |
