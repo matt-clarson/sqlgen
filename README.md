@@ -298,7 +298,7 @@ Tests can be run with Cargo:
 cargo test
 ```
 
-Releases are manual for now. To create a new release, use cargo-release, and cross
+Releases are manual for now. To create a new release, use `cargo-release` and `cross`.
 
 Install them like so:
 
