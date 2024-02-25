@@ -7,6 +7,38 @@ import (
 	"database/sql"
 )
 
+type CountTable1Result struct {
+	NumRows int32
+}
+
+func CountTable1(db *sql.DB, ctx context.Context) ([]CountTable1Result, error) {
+	query := `
+        SELECT
+            count(*) AS num_rows
+        FROM table_1;
+    `
+
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	var results []CountTable1Result
+
+	for rows.Next() {
+		r := CountTable1Result{}
+		err := rows.Scan(
+			&r.NumRows,
+		)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+
+	return results, rows.Err()
+}
+
 type GetJoinedResult struct {
 	T1Id       int32
 	ColA       sql.NullString

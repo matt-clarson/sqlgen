@@ -26,6 +26,23 @@ function pairs<T, U>(xs: T[], ys: U[]): [T, U][] {
     return out;
 }
 
+export type CountTable1Result = {
+    numRows: number;
+};
+
+export async function countTable1(
+    dispatch: Dispatcher,
+): Promise<CountTable1Result[]> {
+    const query = `
+        SELECT
+            count(*) AS num_rows
+        FROM table_1;
+    `;
+
+    const result = await dispatch(query);
+    return mapRows<CountTable1Result>(result.keys, result.rows);
+}
+
 export type GetJoinedResult = {
     t1Id: number;
     colA: string | null;

@@ -3,8 +3,8 @@ use std::{borrow::Borrow, collections::HashMap, fmt::Display};
 use indexmap::IndexMap;
 use sqlparser::{
     ast::{
-        self, AlterTableOperation, ColumnDef, DataType, Expr, Function, FunctionArg,
-        FunctionArgExpr, ObjectName, SelectItem, SetExpr, Statement, TableFactor,
+        self, AlterTableOperation, ColumnDef, DataType, Expr, Function, FunctionArg, ObjectName,
+        SelectItem, SetExpr, Statement, TableFactor,
     },
     dialect,
     parser::Parser,
@@ -544,157 +544,311 @@ impl<'a> QueryTables<'a> {
                     Err(SqlgenError::EntityNotFound(name))
                 }
             }
-            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                if let Some(field) = self.find_field(&ident.value) {
-                    Ok(Box::new(Singleton::from(field.clone())))
-                } else {
-                    Err(SqlgenError::EntityNotFound(ident.to_string()))
-                }
+            SelectItem::UnnamedExpr(expr) => self.expr_to_field_def(expr).map(|field| {
+                let iter: Box<dyn Iterator<Item = FieldDef> + 'b> =
+                    Box::new(Singleton::from(field));
+                iter
+            }),
+            SelectItem::ExprWithAlias { expr, alias } => {
+                self.expr_to_field_def(expr).map(|field| {
+                    let iter: Box<dyn Iterator<Item = FieldDef> + 'b> =
+                        Box::new(Singleton::from(field.clone_with_alias(alias)));
+                    iter
+                })
             }
-            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) => {
-                if let Some(field) = self.find_qualified_field(idents) {
-                    Ok(Box::new(Singleton::from(field.clone())))
-                } else {
-                    Err(SqlgenError::EntityNotFound(compound_name(idents)))
-                }
-            }
-            SelectItem::UnnamedExpr(Expr::Function(func)) => {
-                if let Some(field) = self.builtin_func_to_field(func) {
-                    Ok(Box::new(Singleton::from(field?)))
-                } else {
-                    Err(SqlgenError::Unsupported(format!(
-                        "function {} is not supported",
-                        func.name
-                    )))
-                }
-            }
-            SelectItem::ExprWithAlias {
-                expr: Expr::Identifier(ident),
-                alias,
-            } => {
-                if let Some(field) = self.find_field(&ident.value) {
-                    Ok(Box::new(Singleton::from(field.clone_with_alias(alias))))
-                } else {
-                    Err(SqlgenError::EntityNotFound(ident.to_string()))
-                }
-            }
-            SelectItem::ExprWithAlias {
-                expr: Expr::CompoundIdentifier(idents),
-                alias,
-            } => {
-                if let Some(field) = self.find_qualified_field(idents) {
-                    Ok(Box::new(Singleton::from(field.clone_with_alias(alias))))
-                } else {
-                    Err(SqlgenError::EntityNotFound(compound_name(idents)))
-                }
-            }
-            SelectItem::ExprWithAlias {
-                expr: Expr::Function(func),
-                alias,
-            } => {
-                if let Some(field) = self.builtin_func_to_field(func) {
-                    Ok(Box::new(Singleton::from(field?.clone_with_alias(alias))))
-                } else {
-                    Err(SqlgenError::Unsupported(format!(
-                        "function {} is not supported",
-                        func.name
-                    )))
-                }
-            }
-            c => Err(SqlgenError::Unsupported(format!(
-                "got unsupported select projection: {c:?}",
+        }
+    }
+
+    fn expr_to_field_def(&self, expr: &ast::Expr) -> Result<FieldDef, SqlgenError> {
+        match expr {
+            Expr::Identifier(ident) => self
+                .find_field(&ident.value)
+                .map(Clone::clone)
+                .ok_or_else(|| SqlgenError::EntityNotFound(ident.to_string())),
+            Expr::CompoundIdentifier(idents) => self
+                .find_qualified_field(idents)
+                .map(Clone::clone)
+                .ok_or_else(|| SqlgenError::EntityNotFound(compound_name(idents))),
+            Expr::Function(func) => self.builtin_func_to_field(func),
+            _ => Err(SqlgenError::Unsupported(format!(
+                "expression unsupported {}",
+                expr
             ))),
         }
     }
 
-    fn builtin_func_to_field(&self, func: &Function) -> Option<Result<FieldDef, SqlgenError>> {
+    fn builtin_func_to_field(&self, func: &Function) -> Result<FieldDef, SqlgenError> {
         let name = func.name.to_string();
         match name.to_lowercase().as_str() {
-            "avg" => Some(Ok(FieldDef {
-                name,
-                sqltype: SqlType::Float64,
-                nullable: true,
-            })),
-            "count" => Some(Ok(FieldDef {
-                name,
-                sqltype: SqlType::Int32,
-                nullable: false,
-            })),
-            "group_concat" => Some(Ok(FieldDef {
+            "avg" | "round" => self.infer_null_func_eager(name, func, SqlType::Float64),
+            "lower" | "ltrim" | "replace" | "rtrim" | "upper" => {
+                self.infer_null_func_unary(name, func, SqlType::Text)
+            }
+            "changes" | "count" | "last_insert_rowid" | "random" | "total_changes" => {
+                Ok(FieldDef {
+                    name,
+                    sqltype: SqlType::Int32,
+                    nullable: false,
+                })
+            }
+            "char" | "concat" | "concat_ws" | "format" | "group_concat" | "hex" | "printf"
+            | "quote" | "typeof" => Ok(FieldDef {
                 name,
                 sqltype: SqlType::Text,
                 nullable: false,
-            })),
-            "total" => Some(Ok(FieldDef {
+            }),
+            "glob" => self.infer_null_func_greedy(name, func, SqlType::Bool),
+            "instr" => self.infer_null_func_greedy(name, func, SqlType::Int32),
+            "length" | "octet_length" => self.infer_null_func_unary(name, func, SqlType::Int32),
+            "sign" => self.infer_sqlite_sign_func(name, func),
+            "unicode" => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }),
+            "randomblob" | "zeroblob" => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Binary,
+                nullable: false,
+            }),
+            "total" => Ok(FieldDef {
                 name,
                 sqltype: SqlType::Float64,
                 nullable: false,
-            })),
-            "max" | "min" => match func.args.first() {
-                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident)))) => {
-                    if let Some(field) = self.find_field(&ident.value) {
-                        Some(Ok(FieldDef {
-                            name,
-                            sqltype: field.sqltype(),
-                            nullable: false,
-                        }))
-                    } else {
-                        Some(Err(SqlgenError::EntityNotFound(ident.to_string())))
-                    }
-                }
-                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(
-                    idents,
-                )))) => {
-                    if let Some(field) = self.find_qualified_field(idents) {
-                        Some(Ok(FieldDef {
-                            name,
-                            sqltype: field.sqltype(),
-                            nullable: false,
-                        }))
-                    } else {
-                        Some(Err(SqlgenError::EntityNotFound(compound_name(idents))))
-                    }
-                }
-                _ => Some(Err(SqlgenError::Unknown(
-                    format!("{name} function called with invalid args - expected a single column identifier"),
-                ))),
+            }),
+            "unhex" => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Binary,
+                nullable: true,
+            }),
+            "coalesce" | "ifnull" | "max" | "min" | "nullif" => {
+                self.no_map_func_eager(name, func, 0)
+            }
+            "iif" => self.no_map_func_eager(name, func, 1),
+            "abs" | "sum" => self.infer_sqlite_numeric_func(name, func),
+            "substr" => self.nullable_text_binary_func(name, func),
+            "date" | "time" | "datetime" => {
+                self.infer_sqlite_date_func(name, func, SqlType::Text, 0)
+            }
+            "julianday" => self.infer_sqlite_date_func(name, func, SqlType::Float64, 0),
+            "unixepoch" => self.infer_sqlite_date_func(name, func, SqlType::Int32, 0),
+            "strftime" => self.infer_sqlite_date_func(name, func, SqlType::Text, 1),
+            "timediff" => self.infer_null_func_greedy(name, func, SqlType::Text),
+            _ => Err(SqlgenError::Unsupported(format!(
+                "function {} is not supported",
+                func.name
+            ))),
+        }
+    }
+
+    fn infer_sqlite_date_func(
+        &self,
+        name: String,
+        func: &ast::Function,
+        sqltype: SqlType,
+        first_arg_pos: usize,
+    ) -> Result<FieldDef, SqlgenError> {
+        match func.args.iter().nth(first_arg_pos) {
+            Some(arg) => self.function_arg_to_field_def(arg).map(|field| FieldDef {
+                name,
+                sqltype,
+                nullable: field.nullable,
+            }),
+            None => Ok(FieldDef {
+                name,
+                sqltype,
+                nullable: false,
+            }),
+        }
+    }
+
+    fn infer_null_func_unary(
+        &self,
+        name: String,
+        func: &ast::Function,
+        sqltype: SqlType,
+    ) -> Result<FieldDef, SqlgenError> {
+        match func.args.first() {
+            Some(arg) => self.function_arg_to_field_def(arg).map(|field| FieldDef {
+                name,
+                sqltype,
+                nullable: field.nullable,
+            }),
+            None => Err(SqlgenError::Unknown(format!(
+                "{name} function called with invalid args - expected a single column identifier"
+            ))),
+        }
+    }
+
+    fn infer_null_func_eager(
+        &self,
+        name: String,
+        func: &ast::Function,
+        sqltype: SqlType,
+    ) -> Result<FieldDef, SqlgenError> {
+        self.no_map_func_eager(name, func, 0).map(|field| FieldDef {
+            name: field.name,
+            sqltype,
+            nullable: field.nullable,
+        })
+    }
+
+    fn infer_null_func_greedy(
+        &self,
+        name: String,
+        func: &ast::Function,
+        sqltype: SqlType,
+    ) -> Result<FieldDef, SqlgenError> {
+        self.no_map_func_greedy(name, func, 0)
+            .map(|field| FieldDef {
+                name: field.name,
+                sqltype,
+                nullable: field.nullable,
+            })
+    }
+
+    fn infer_sqlite_sign_func(
+        &self,
+        name: String,
+        func: &ast::Function,
+    ) -> Result<FieldDef, SqlgenError> {
+        self.no_map_func_eager(name, func, 0)
+            .map(|field| match field.sqltype {
+                SqlType::Int8
+                | SqlType::Int16
+                | SqlType::Int32
+                | SqlType::Int64
+                | SqlType::Float32
+                | SqlType::Float64
+                | SqlType::Bool => FieldDef {
+                    name: field.name,
+                    sqltype: SqlType::Int32,
+                    nullable: field.nullable,
+                },
+                _ => FieldDef {
+                    name: field.name,
+                    sqltype: SqlType::Int32,
+                    nullable: true,
+                },
+            })
+    }
+
+    fn no_map_func_eager(
+        &self,
+        name: String,
+        func: &ast::Function,
+        num_to_skip: usize,
+    ) -> Result<FieldDef, SqlgenError> {
+        let folded = func
+            .args
+            .iter()
+            .skip(num_to_skip)
+            .fold(None, |acc, arg| match acc {
+                Some(Ok(
+                    prev_field @ FieldDef {
+                        nullable: false, ..
+                    },
+                )) => Some(Ok(prev_field)),
+                Some(Ok(_)) | None => Some(self.function_arg_to_field_def(arg)),
+                Some(err) => Some(err),
+            });
+
+        match folded {
+            Some(result) => result.map(|field| field.clone_with_alias(name)),
+            None => Err(SqlgenError::Unknown(format!(
+                "{name} function called with invalid args - expected a single column identifier"
+            ))),
+        }
+    }
+
+    fn no_map_func_greedy(
+        &self,
+        name: String,
+        func: &ast::Function,
+        num_to_skip: usize,
+    ) -> Result<FieldDef, SqlgenError> {
+        let folded = func
+            .args
+            .iter()
+            .skip(num_to_skip)
+            .fold(None, |acc, arg| match acc {
+                Some(Ok(prev_field @ FieldDef { nullable: true, .. })) => Some(Ok(prev_field)),
+                Some(Ok(_)) | None => Some(self.function_arg_to_field_def(arg)),
+                Some(err) => Some(err),
+            });
+
+        match folded {
+            Some(result) => result.map(|field| field.clone_with_alias(name)),
+            None => Err(SqlgenError::Unknown(format!(
+                "{name} function called with invalid args - expected a single column identifier"
+            ))),
+        }
+    }
+
+    fn infer_sqlite_numeric_func(
+        &self,
+        name: String,
+        func: &ast::Function,
+    ) -> Result<FieldDef, SqlgenError> {
+        self.no_map_func_eager(name, func, 0)
+            .map(|field| match field.sqltype {
+                SqlType::Int8
+                | SqlType::Int16
+                | SqlType::Int32
+                | SqlType::Int64
+                | SqlType::Bool => FieldDef {
+                    name: field.name,
+                    sqltype: SqlType::Int32,
+                    nullable: field.nullable,
+                },
+                _ => FieldDef {
+                    name: field.name,
+                    sqltype: SqlType::Float64,
+                    nullable: field.nullable,
+                },
+            })
+    }
+
+    fn nullable_text_binary_func(
+        &self,
+        name: String,
+        func: &ast::Function,
+    ) -> Result<FieldDef, SqlgenError> {
+        match func.args.first() {
+            Some(arg) => match self.function_arg_to_field_def(arg) {
+                Ok(
+                    field @ FieldDef {
+                        sqltype: SqlType::Binary,
+                        ..
+                    },
+                ) => Ok(FieldDef {
+                    name,
+                    sqltype: field.sqltype,
+                    nullable: field.nullable,
+                }),
+                Ok(field) => Ok(FieldDef {
+                    name,
+                    sqltype: SqlType::Text,
+                    nullable: field.nullable,
+                }),
+                Err(err) => Err(err),
             },
-            "sum" => match func.args.first() {
-                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident)))) => {
-                    if let Some(field) = self.find_field(&ident.value) {
-                        Some(Ok(FieldDef {
-                            name,
-                            sqltype: match field.sqltype() {
-                                SqlType::Int8 | SqlType::Int16 | SqlType::Int32 | SqlType::Int64 => field.sqltype(),
-                                _ => SqlType::Float64
-                            },
-                            nullable: true,
-                        }))
-                    } else {
-                        Some(Err(SqlgenError::EntityNotFound(ident.to_string())))
-                    }
-                }
-                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(
-                    idents,
-                )))) => {
-                    if let Some(field) = self.find_qualified_field(idents) {
-                        Some(Ok(FieldDef {
-                            name,
-                            sqltype: match field.sqltype() {
-                                SqlType::Int8 | SqlType::Int16 | SqlType::Int32 | SqlType::Int64 => field.sqltype(),
-                                _ => SqlType::Float64
-                            },
-                            nullable: true,
-                        }))
-                    } else {
-                        Some(Err(SqlgenError::EntityNotFound(compound_name(idents))))
-                    }
-                }
-                _ => Some(Err(SqlgenError::Unknown(
-                    format!("{name} function called with invalid args - expected a single column identifier"),
-                ))),
-            },
-            _ => None,
+            None => Err(SqlgenError::Unknown(format!(
+                "{name} function called with invalid args - expected a single column identifier"
+            ))),
+        }
+    }
+
+    fn function_arg_to_field_def(&self, arg: &FunctionArg) -> Result<FieldDef, SqlgenError> {
+        match arg {
+            FunctionArg::Named {
+                arg: ast::FunctionArgExpr::Expr(expr),
+                ..
+            } => self.expr_to_field_def(expr),
+            FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => self.expr_to_field_def(expr),
+            _ => Err(SqlgenError::Unsupported(
+                "wildcard expressions as function args aren't supported".to_string(),
+            )),
         }
     }
 }
@@ -1385,7 +1539,31 @@ mod test {
 
         let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
         let actual = parser
-            .parse_query("SELECT avg(a) FROM t1;", &schema)
+            .parse_query("SELECT avg(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_avg_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "avg".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT avg(col_a) FROM t1;", &schema)
             .unwrap();
 
         assert_eq!(expected, actual);
@@ -1407,7 +1585,7 @@ mod test {
 
         let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
         let actual = parser
-            .parse_query("SELECT avg(a) AS some_name FROM t1;", &schema)
+            .parse_query("SELECT avg(col_a) AS some_name FROM t1;", &schema)
             .unwrap();
 
         assert_eq!(expected, actual);
@@ -1463,7 +1641,7 @@ mod test {
             projection: vec![FieldDef {
                 name: "max".to_string(),
                 sqltype: SqlType::Int32,
-                nullable: false,
+                nullable: true,
             }],
         };
 
@@ -1480,12 +1658,36 @@ mod test {
     }
 
     #[test]
+    fn parse_sqlite_agg_func_max_int_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "max".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT max(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
     fn parse_sqlite_agg_func_max_text() {
         let expected = Query {
             projection: vec![FieldDef {
                 name: "max".to_string(),
                 sqltype: SqlType::Text,
-                nullable: false,
+                nullable: true,
             }],
         };
 
@@ -1507,7 +1709,7 @@ mod test {
             projection: vec![FieldDef {
                 name: "max".to_string(),
                 sqltype: SqlType::Text,
-                nullable: false,
+                nullable: true,
             }],
         };
 
@@ -1524,7 +1726,7 @@ mod test {
     }
 
     #[test]
-    fn parse_sqlite_agg_func_min_int() {
+    fn parse_sqlite_agg_func_min_int_not_null() {
         let expected = Query {
             projection: vec![FieldDef {
                 name: "min".to_string(),
@@ -1537,7 +1739,9 @@ mod test {
             dialect: SqlDialect::Sqlite,
         };
 
-        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
         let actual = parser
             .parse_query("SELECT min(col_a) FROM t1;", &schema)
             .unwrap();
@@ -1551,7 +1755,7 @@ mod test {
             projection: vec![FieldDef {
                 name: "min".to_string(),
                 sqltype: SqlType::Text,
-                nullable: false,
+                nullable: true,
             }],
         };
 
@@ -1573,7 +1777,7 @@ mod test {
             projection: vec![FieldDef {
                 name: "min".to_string(),
                 sqltype: SqlType::Text,
-                nullable: false,
+                nullable: true,
             }],
         };
 
@@ -1590,7 +1794,7 @@ mod test {
     }
 
     #[test]
-    fn parse_sqlite_agg_func_sum_int() {
+    fn parse_sqlite_agg_func_sum_int_nullable() {
         let expected = Query {
             projection: vec![FieldDef {
                 name: "sum".to_string(),
@@ -1604,6 +1808,30 @@ mod test {
         };
 
         let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT sum(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_sum_int_not_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "sum".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
         let actual = parser
             .parse_query("SELECT sum(col_a) FROM t1;", &schema)
             .unwrap();
@@ -1636,7 +1864,7 @@ mod test {
     }
 
     #[test]
-    fn parse_sqlite_agg_func_sum_text() {
+    fn parse_sqlite_agg_func_sum_text_nullable() {
         let expected = Query {
             projection: vec![FieldDef {
                 name: "sum".to_string(),
@@ -1650,6 +1878,30 @@ mod test {
         };
 
         let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT sum(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_agg_func_sum_text_not_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "sum".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL);")
+            .unwrap();
         let actual = parser
             .parse_query("SELECT sum(col_a) FROM t1;", &schema)
             .unwrap();
@@ -1720,6 +1972,1934 @@ mod test {
         let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
         let actual = parser
             .parse_query("SELECT total(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_abs_int_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "abs".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT abs(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_abs_int_not_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "abs".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT abs(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_abs_float() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "abs".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a FLOAT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT abs(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_abs_text_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "abs".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT abs(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_abs_text_not_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "abs".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT abs(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_changes() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "changes".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser.parse_query("SELECT changes();", &schema).unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_char() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "char".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT, col_b INT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT char(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_coalesce_int() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "coalesce".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT, col_b INT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT coalesce(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_coalesce_int_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "coalesce".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL, col_b INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT coalesce(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_coalesce_int_mixed_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "coalesce".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT, col_b INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT coalesce(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_coalesce_float() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "coalesce".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a FLOAT, col_b FLOAT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT coalesce(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_coalesce_text() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "coalesce".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT coalesce(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_concat() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "concat".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT concat(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_concat_ws() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "concat_ws".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT concat_ws(', ', col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_format() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "format".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT format('%d) %s', col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_glob() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "glob".to_string(),
+                sqltype: SqlType::Bool,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT glob(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_glob_left_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "glob".to_string(),
+                sqltype: SqlType::Bool,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT glob(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_glob_right_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "glob".to_string(),
+                sqltype: SqlType::Bool,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT, col_b TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT glob(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_glob_both_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "glob".to_string(),
+                sqltype: SqlType::Bool,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL, col_b TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT glob(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_hex() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "hex".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a BLOB);").unwrap();
+        let actual = parser
+            .parse_query("SELECT hex(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_ifnull_int() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "ifnull".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT, col_b INT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT ifnull(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_ifnull_int_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "ifnull".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL, col_b INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT ifnull(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_ifnull_float() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "ifnull".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a FLOAT, col_b FLOAT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT ifnull(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_ifnull_text() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "ifnull".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT ifnull(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_iif_int() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "iif".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT, col_b INT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT iif(true, col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_iif_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "iif".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL, col_b INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT iif(true, col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_iif_float() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "iif".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a FLOAT, col_b FLOAT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT iif(false, col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_iif_text() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "iif".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT iif(1 > 2, col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_instr() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "instr".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT instr(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_instr_left_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "instr".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT instr(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_instr_right_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "instr".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT, col_b TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT instr(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_instr_both_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "instr".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL, col_b TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT instr(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_last_insert_rowid() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "last_insert_rowid".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT last_insert_rowid();", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_length() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "length".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT length(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_lower() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "lower".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT lower(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_lower_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "lower".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT lower(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_ltrim() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "ltrim".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT ltrim(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_nullif_int() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "nullif".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT, col_b INT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT nullif(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_nullif_int_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "nullif".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL, col_b INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT nullif(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_nullif_float() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "nullif".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a FLOAT, col_b FLOAT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT nullif( col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_nullif_text() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "nullif".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT nullif(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_octet_length() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "octet_length".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT octet_length(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_printf() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "printf".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT printf('%d) %s', col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_quote() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "quote".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT quote('%d) %s', col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_random() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "random".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser.parse_query("SELECT random();", &schema).unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_randomblob() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "randomblob".to_string(),
+                sqltype: SqlType::Binary,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT randomblob(64);", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_replace() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "replace".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT replace(col_a, 'a', 'b') FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_round() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "round".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a FLOAT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT round(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_rtrim() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "rtrim".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT rtrim(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_sign_int() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "sign".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT sign(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_sign_int_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "sign".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT sign(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_sign_text() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "sign".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT sign(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_substr_text_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "substr".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT substr(col_a, 10) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_substr_text_not_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "substr".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT substr(col_a, 10) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_substr_binary() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "substr".to_string(),
+                sqltype: SqlType::Binary,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a BLOB);").unwrap();
+        let actual = parser
+            .parse_query("SELECT substr(col_a, 10) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_substr_int() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "substr".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT substr(col_a, 10) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_total_changes() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "total_changes".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT total_changes();", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_typeof() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "typeof".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT typeof(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_unhex() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unhex".to_string(),
+                sqltype: SqlType::Binary,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT unhex(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_unicode() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unicode".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT unicode(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_upper() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "upper".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT upper(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_scalar_func_zeroblob() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "zeroblob".to_string(),
+                sqltype: SqlType::Binary,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser.parse_query("SELECT zeroblob(64);", &schema).unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_date_func_no_args() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "date".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser.parse_query("SELECT date();", &schema).unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_date_func_not_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "date".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT date(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_date_func_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "date".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT date(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_time_func_no_args() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "time".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser.parse_query("SELECT time();", &schema).unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_time_func_not_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "time".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT time(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_time_func_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "time".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT time(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_datetime_func_no_args() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "datetime".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser.parse_query("SELECT datetime();", &schema).unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_datetime_func_not_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "datetime".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT datetime(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_datetime_func_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "datetime".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT datetime(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_julianday_func_no_args() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "julianday".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser.parse_query("SELECT julianday();", &schema).unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_julianday_func_not_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "julianday".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT julianday(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_julianday_func_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "julianday".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT julianday(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_unixepoch_func_no_args() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unixepoch".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser.parse_query("SELECT unixepoch();", &schema).unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_unixepoch_func_not_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unixepoch".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT unixepoch(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_unixepoch_func_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unixepoch".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT unixepoch(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_strftime_func_no_args() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "strftime".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT strftime('%Y-%m-%d');", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_strftime_func_not_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "strftime".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT strftime('%Y-%m-%d', col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_strftime_func_nullable() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "strftime".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a INT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT strftime('%Y-%m-%d', col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_func_timediff() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "timediff".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT timediff(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_func_timediff_left_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "timediff".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL, col_b TEXT);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT timediff(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_func_timediff_right_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "timediff".to_string(),
+                sqltype: SqlType::Text,
+                nullable: true,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT, col_b TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT timediff(col_a, col_b) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_sqlite_func_timediff_both_not_null() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "timediff".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL, col_b TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT timediff(col_a, col_b) FROM t1;", &schema)
             .unwrap();
 
         assert_eq!(expected, actual);
