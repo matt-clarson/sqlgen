@@ -93,3 +93,48 @@ fn golang_sqlite_migration() -> io::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn typescript_sqlite_aggregation() -> io::Result<()> {
+    let schemafile = "examples/sqlite/aggregation/schema.sql";
+    let queriesdir = "examples/sqlite/aggregation/queries";
+    let outputfile = "examples/sqlite/aggregation/typescript/queries.ts";
+
+    let expected = fs::read_to_string(outputfile).unwrap();
+
+    let mut sqlgen = Sqlgen {
+        schema: fs::read_to_string(schemafile)?,
+        queries: Files::new(queriesdir, SqlFileFilter {})?,
+        code_generator: sqlgen::lang::typescript::TSCodegen {},
+        dialect: SqlDialect::Sqlite,
+    };
+
+    let actual = sqlgen.run().unwrap();
+
+    assert_eq!(actual, expected);
+
+    Ok(())
+}
+
+#[test]
+fn golang_sqlite_aggregation() -> io::Result<()> {
+    let schemafile = "examples/sqlite/aggregation/schema.sql";
+    let queriesdir = "examples/sqlite/aggregation/queries";
+    let outputfile = "examples/sqlite/aggregation/golang/queries.go";
+
+    let expected = fs::read_to_string(outputfile).unwrap();
+
+    let mut sqlgen = Sqlgen {
+        schema: fs::read_to_string(schemafile)?,
+        queries: Files::new(queriesdir, SqlFileFilter {})?,
+        code_generator: sqlgen::lang::golang::GoCodegen::default(),
+        dialect: SqlDialect::Sqlite,
+    };
+
+    let actual = sqlgen.run().unwrap();
+
+    assert_eq!(actual, expected);
+
+    Ok(())
+}
+

@@ -1,14 +1,8 @@
 use std::{borrow::Borrow, collections::HashMap, fmt::Display};
 
 use indexmap::IndexMap;
-use sqlparser::{
-    ast::{
-        self, AlterTableOperation, ColumnDef, DataType, Expr, Function, FunctionArg, ObjectName,
-        SelectItem, SetExpr, Statement, TableFactor,
-    },
-    dialect,
-    parser::Parser,
-};
+use sqlparser::{ast, dialect, parser::Parser};
+use uuid::Uuid;
 
 use crate::error::SqlgenError;
 
@@ -207,7 +201,7 @@ impl Sqlparser {
 
         for stmt in statements {
             match stmt {
-                Statement::CreateTable { name, columns, .. } => {
+                ast::Statement::CreateTable { name, columns, .. } => {
                     let table_name = name.0.last().unwrap().to_string();
                     let mut table = Table::new(table_name.clone());
                     for coldef in &columns {
@@ -216,9 +210,9 @@ impl Sqlparser {
                     }
                     schema.tables.insert(table_name, table);
                 }
-                Statement::AlterTable {
+                ast::Statement::AlterTable {
                     name,
-                    operation: AlterTableOperation::AddColumn { column_def, .. },
+                    operation: ast::AlterTableOperation::AddColumn { column_def, .. },
                 } => {
                     let table_name = name.0.last().unwrap().to_string();
                     if let Some(table) = schema.tables.get_mut(&table_name) {
@@ -230,10 +224,10 @@ impl Sqlparser {
                         )));
                     }
                 }
-                Statement::AlterTable {
+                ast::Statement::AlterTable {
                     name,
                     operation:
-                        AlterTableOperation::RenameColumn {
+                        ast::AlterTableOperation::RenameColumn {
                             old_column_name,
                             new_column_name,
                         },
@@ -254,9 +248,9 @@ impl Sqlparser {
                         )));
                     }
                 }
-                Statement::AlterTable {
+                ast::Statement::AlterTable {
                     name,
-                    operation: AlterTableOperation::DropColumn { column_name, .. },
+                    operation: ast::AlterTableOperation::DropColumn { column_name, .. },
                 } => {
                     let table_name = name.0.last().unwrap().to_string();
                     if let Some(table) = schema.tables.get_mut(&table_name) {
@@ -289,48 +283,44 @@ impl Sqlparser {
         let mut out_query = Query { projection: vec![] };
 
         match stmt {
-            Statement::Insert {
+            ast::Statement::Insert {
                 returning: None, ..
             } => Ok(out_query),
-            Statement::Insert {
+            ast::Statement::Insert {
                 table_name,
                 returning: Some(projection),
                 ..
             } => {
                 let mut query_tables = QueryTables::new(schema);
-                query_tables.try_insert_table(table_name)?;
-                for select_item in projection {
-                    for field in query_tables.get_fields_for_select_item(select_item)? {
-                        out_query.projection.push(field)
-                    }
+                self.try_store_named_query_table(&mut query_tables, table_name)?;
+                for field in SqliteFieldIter::new(&query_tables, projection) {
+                    out_query.projection.push(field?);
                 }
                 Ok(out_query)
             }
-            Statement::Update {
+            ast::Statement::Update {
                 returning: None, ..
             } => Ok(out_query),
-            Statement::Update {
+            ast::Statement::Update {
                 table,
                 returning: Some(projection),
                 ..
             } => {
                 let mut query_tables = QueryTables::new(schema);
                 for join in &table.joins {
-                    query_tables.try_insert_table_factor(&join.relation)?;
+                    self.try_store_query_table_factor(&mut query_tables, &join.relation)?;
                 }
-                query_tables.try_insert_table_factor(&table.relation)?;
+                self.try_store_query_table_factor(&mut query_tables, &table.relation)?;
 
-                for select_item in projection {
-                    for field in query_tables.get_fields_for_select_item(select_item)? {
-                        out_query.projection.push(field)
-                    }
+                for field in SqliteFieldIter::new(&query_tables, projection) {
+                    out_query.projection.push(field?);
                 }
                 Ok(out_query)
             }
-            Statement::Delete {
+            ast::Statement::Delete {
                 returning: None, ..
             } => Ok(out_query),
-            Statement::Delete {
+            ast::Statement::Delete {
                 from,
                 returning: Some(projection),
                 ..
@@ -338,50 +328,82 @@ impl Sqlparser {
                 let mut query_tables = QueryTables::new(schema);
                 for table_with_joins in from {
                     for join in &table_with_joins.joins {
-                        query_tables.try_insert_table_factor(&join.relation)?;
+                        self.try_store_query_table_factor(&mut query_tables, &join.relation)?;
                     }
-                    query_tables.try_insert_table_factor(&table_with_joins.relation)?;
+                    self.try_store_query_table_factor(
+                        &mut query_tables,
+                        &table_with_joins.relation,
+                    )?;
                 }
 
-                for select_item in projection {
-                    for field in query_tables.get_fields_for_select_item(select_item)? {
-                        out_query.projection.push(field)
-                    }
+                for field in SqliteFieldIter::new(&query_tables, projection) {
+                    out_query.projection.push(field?);
                 }
 
                 Ok(out_query)
             }
-            Statement::Query(query) => {
-                if query.with.is_some() {
-                    return Err(SqlgenError::Unsupported(
-                        "CTEs are not supported".to_string(),
-                    ));
-                }
-                return match query.body.as_ref() {
-                    SetExpr::Select(select) => {
-                        let mut query_tables = QueryTables::new(schema);
-                        for table_with_joins in &select.from {
-                            for join in &table_with_joins.joins {
-                                query_tables.try_insert_table_factor(&join.relation)?;
-                            }
-                            query_tables.try_insert_table_factor(&table_with_joins.relation)?;
-                        }
-
-                        for select_item in &select.projection {
-                            for field in query_tables.get_fields_for_select_item(select_item)? {
-                                out_query.projection.push(field);
-                            }
-                        }
-
-                        return Ok(out_query);
-                    }
-                    _ => Err(SqlgenError::Unsupported(
-                        "only SELECT, UPDATE, INSERT, and DELETE statements are supported in queries".to_string(),
-                    )),
-                };
+            ast::Statement::Query(query) => {
+                let query_tables = QueryTables::new(schema);
+                self.parse_select_query(query.as_ref(), &query_tables)
             }
             _ => Err(SqlgenError::Unsupported(
                 "only SELECT, UPDATE, INSERT, and DELETE  statements are supported in queries"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn try_store_named_query_table(
+        &self,
+        query_tables: &mut QueryTables,
+        name: &ast::ObjectName,
+    ) -> Result<(), SqlgenError> {
+        let table_name = name.0.last().unwrap().to_string();
+        if let Some(table) = query_tables.find_table_in_schema(&name.to_string()) {
+            query_tables.insert_table(table_name, table.clone());
+            Ok(())
+        } else {
+            Err(SqlgenError::EntityNotFound(format!(
+                "table {name} does not exist in known schema"
+            )))
+        }
+    }
+
+    fn try_store_query_table_factor(
+        &self,
+        query_tables: &mut QueryTables,
+        table_factor: &ast::TableFactor,
+    ) -> Result<(), SqlgenError> {
+        match table_factor {
+            ast::TableFactor::Table { name, alias, .. } => {
+                let table_name = alias
+                    .as_ref()
+                    .map(|a| a.name.to_string())
+                    .unwrap_or_else(|| name.0.last().unwrap().to_string());
+                if let Some(table) = query_tables.find_table_in_schema(&name.to_string()) {
+                    query_tables.insert_table(table_name, table.clone());
+                    Ok(())
+                } else {
+                    Err(SqlgenError::EntityNotFound(format!(
+                        "table {name} does not exist in known schema"
+                    )))
+                }
+            }
+            ast::TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let table_name = alias
+                    .as_ref()
+                    .map(|a| a.name.to_string())
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+                let subquery_out = self.parse_select_query(subquery, &query_tables)?;
+                query_tables.insert_table_from_query(&table_name, &subquery_out);
+                dbg!(query_tables);
+                Ok(())
+            }
+            _ => Err(SqlgenError::Unsupported(
+                "only named table expressions and subqueries are supported in FROM clauses"
                     .to_string(),
             )),
         }
@@ -397,161 +419,110 @@ impl Sqlparser {
             .and_then(|mut p| p.parse_statements())
             .map_err(|e| e.into())
     }
-}
 
-impl TryFrom<&ColumnDef> for FieldDef {
-    type Error = SqlgenError;
+    fn parse_select_query(
+        &self,
+        query: &ast::Query,
+        in_scope_tables: &QueryTables,
+    ) -> Result<Query, SqlgenError> {
+        let mut out_query = Query { projection: vec![] };
+        let mut query_tables = in_scope_tables.clone();
 
-    fn try_from(coldef: &ColumnDef) -> Result<Self, Self::Error> {
-        let field_name = coldef.name.to_string();
-        let sqltype = SqlType::try_from(&coldef.data_type)?;
-        let not_null = coldef.options.iter().any(|opt| {
-            matches!(
-                opt.option,
-                ast::ColumnOption::NotNull | ast::ColumnOption::Unique { is_primary: true }
-            )
-        });
-        Ok(FieldDef {
-            name: field_name.clone(),
-            sqltype,
-            nullable: !not_null,
-        })
-    }
-}
-
-impl TryFrom<&DataType> for SqlType {
-    type Error = SqlgenError;
-
-    fn try_from(value: &DataType) -> Result<Self, Self::Error> {
-        match value {
-            ast::DataType::Bool | ast::DataType::Boolean => Ok(SqlType::Bool),
-            ast::DataType::TinyInt(_) => Ok(SqlType::Int8),
-            ast::DataType::SmallInt(_) | ast::DataType::Int2(_) => Ok(SqlType::Int16),
-            ast::DataType::Int4(_)
-            | ast::DataType::Integer(_)
-            | ast::DataType::MediumInt(_)
-            | ast::DataType::Int(_) => Ok(SqlType::Int32),
-            ast::DataType::BigInt(_) | ast::DataType::Int8(_) => Ok(SqlType::Int64),
-            ast::DataType::Text => Ok(SqlType::Text),
-            ast::DataType::Real | ast::DataType::Float4 => Ok(SqlType::Float32),
-            ast::DataType::Float(_)
-            | ast::DataType::Float8
-            | ast::DataType::Double
-            | ast::DataType::DoublePrecision => Ok(SqlType::Float64),
-            ast::DataType::Blob(_) => Ok(SqlType::Binary),
-            data_type => Err(SqlgenError::Unsupported(format!(
-                "data type {data_type} is not supported"
-            ))),
-        }
-    }
-}
-
-struct QueryTables<'a> {
-    schema: &'a Schema,
-    tables: IndexMap<String, Table>,
-}
-
-impl<'a> QueryTables<'a> {
-    fn new(schema: &'a Schema) -> Self {
-        Self {
-            schema,
-            tables: IndexMap::new(),
-        }
-    }
-
-    fn insert<S: Into<String>>(&mut self, name: S, table: Table) {
-        self.tables.insert(name.into(), table);
-    }
-
-    fn find_table<S: AsRef<str>>(&self, table_name: S) -> Option<&Table> {
-        self.tables.get(table_name.as_ref())
-    }
-
-    fn all_table_fields(&self) -> Vec<&FieldDef> {
-        self.tables
-            .values()
-            .flat_map(|t| t.get_sorted_fields())
-            .collect()
-    }
-
-    fn find_qualified_field<S: Display>(&self, name_parts: &[S]) -> Option<&FieldDef> {
-        let table_name = name_parts.first().unwrap().to_string();
-        let field_name = name_parts.last().unwrap().to_string();
-
-        self.tables
-            .get(&table_name)
-            .and_then(|table| table.find_field(&field_name))
-    }
-
-    fn find_field<S: AsRef<str>>(&self, field_name: S) -> Option<&FieldDef> {
-        for table in self.tables.values() {
-            if let Some(field) = table.find_field(field_name.as_ref()) {
-                return Some(field);
+        if let Some(with_clause) = &query.with {
+            for cte in &with_clause.cte_tables {
+                let cte_out = self.parse_select_query(&cte.query, &query_tables)?;
+                query_tables.insert_temp_from_query(&cte.alias, &cte_out);
             }
         }
-        None
-    }
 
-    fn try_insert_table_factor(&mut self, table_factor: &TableFactor) -> Result<(), SqlgenError> {
-        match table_factor {
-            sqlparser::ast::TableFactor::Table { name, alias, .. } => {
-                let table_name = alias
-                    .as_ref()
-                    .map(|a| a.name.to_string())
-                    .unwrap_or_else(|| name.0.last().unwrap().to_string());
-                if let Some(table) = self.schema.get_table(&name.to_string()) {
-                    self.insert(table_name, table.clone());
-                    Ok(())
-                } else {
-                    Err(SqlgenError::EntityNotFound(format!(
-                        "table {name} does not exist in known schema"
-                    )))
+        return match query.body.as_ref() {
+            ast::SetExpr::Select(select) => {
+                for table_with_joins in &select.from {
+                    for join in &table_with_joins.joins {
+                        self.try_store_query_table_factor(&mut query_tables, &join.relation)?;
+                    }
+                    self.try_store_query_table_factor(
+                        &mut query_tables,
+                        &table_with_joins.relation,
+                    )?;
                 }
+
+                for field in SqliteFieldIter::new(&query_tables, &select.projection) {
+                    out_query.projection.push(field?);
+                }
+
+                return Ok(out_query);
             }
             _ => Err(SqlgenError::Unsupported(
-                "only named table expressions are supported in FROM clauses".to_string(),
+                "only SELECT, UPDATE, INSERT, and DELETE statements are supported in queries"
+                    .to_string(),
             )),
+        };
+    }
+}
+
+struct SqliteFieldIter<'a> {
+    query_tables: &'a QueryTables<'a>,
+    select_items: Box<dyn Iterator<Item = &'a ast::SelectItem> + 'a>,
+    current: Option<Box<dyn Iterator<Item = FieldDef> + 'a>>,
+}
+
+impl<'a> Iterator for SqliteFieldIter<'a> {
+    type Item = Result<FieldDef, SqlgenError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.current
+            .as_mut()
+            .and_then(|iter| Ok(iter.next()).transpose())
+            .or_else(|| {
+                self.select_items.next().and_then(|item| {
+                    self.get_fields_for_select_item(item)
+                        .map(|mut next_iter| {
+                            let next = next_iter.next();
+                            self.current = Some(next_iter);
+                            next
+                        })
+                        .transpose()
+                })
+            })
+    }
+}
+
+impl<'a> SqliteFieldIter<'a> {
+    fn new(query_tables: &'a QueryTables, select_items: &'a [ast::SelectItem]) -> Self {
+        Self {
+            current: None,
+            query_tables,
+            select_items: Box::new(select_items.iter()),
         }
     }
 
-    fn try_insert_table(&mut self, name: &ObjectName) -> Result<(), SqlgenError> {
-        let table_name = name.0.last().unwrap().to_string();
-        if let Some(table) = self.schema.get_table(&name.to_string()) {
-            self.insert(table_name, table.clone());
-            Ok(())
-        } else {
-            Err(SqlgenError::EntityNotFound(format!(
-                "table {name} does not exist in known schema"
-            )))
-        }
-    }
-
-    fn get_fields_for_select_item<'b>(
-        &'b self,
-        select_item: &SelectItem,
-    ) -> Result<Box<dyn Iterator<Item = FieldDef> + 'b>, SqlgenError> {
+    fn get_fields_for_select_item(
+        &self,
+        select_item: &ast::SelectItem,
+    ) -> Result<Box<dyn Iterator<Item = FieldDef> + 'a>, SqlgenError> {
         match select_item {
-            SelectItem::Wildcard(_) => {
-                let iter = self.all_table_fields().into_iter().cloned();
+            ast::SelectItem::Wildcard(_) => {
+                let iter = self.query_tables.all_table_fields().into_iter().cloned();
                 Ok(Box::new(iter))
             }
-            SelectItem::QualifiedWildcard(table_name, _) => {
+            ast::SelectItem::QualifiedWildcard(table_name, _) => {
                 let name = table_name.to_string();
-                if let Some(table) = self.find_table(&name) {
+                if let Some(table) = self.query_tables.find_table(&name) {
                     let iter = table.get_sorted_fields().into_iter().cloned();
                     Ok(Box::new(iter))
                 } else {
                     Err(SqlgenError::EntityNotFound(name))
                 }
             }
-            SelectItem::UnnamedExpr(expr) => self.expr_to_field_def(expr).map(|field| {
-                let iter: Box<dyn Iterator<Item = FieldDef> + 'b> =
+            ast::SelectItem::UnnamedExpr(expr) => self.expr_to_field_def(expr).map(|field| {
+                let iter: Box<dyn Iterator<Item = FieldDef> + 'a> =
                     Box::new(Singleton::from(field));
                 iter
             }),
-            SelectItem::ExprWithAlias { expr, alias } => {
+            ast::SelectItem::ExprWithAlias { expr, alias } => {
                 self.expr_to_field_def(expr).map(|field| {
-                    let iter: Box<dyn Iterator<Item = FieldDef> + 'b> =
+                    let iter: Box<dyn Iterator<Item = FieldDef> + 'a> =
                         Box::new(Singleton::from(field.clone_with_alias(alias)));
                     iter
                 })
@@ -561,15 +532,17 @@ impl<'a> QueryTables<'a> {
 
     fn expr_to_field_def(&self, expr: &ast::Expr) -> Result<FieldDef, SqlgenError> {
         match expr {
-            Expr::Identifier(ident) => self
+            ast::Expr::Identifier(ident) => self
+                .query_tables
                 .find_field(&ident.value)
                 .map(Clone::clone)
                 .ok_or_else(|| SqlgenError::EntityNotFound(ident.to_string())),
-            Expr::CompoundIdentifier(idents) => self
+            ast::Expr::CompoundIdentifier(idents) => self
+                .query_tables
                 .find_qualified_field(idents)
                 .map(Clone::clone)
                 .ok_or_else(|| SqlgenError::EntityNotFound(compound_name(idents))),
-            Expr::Function(func) => self.builtin_func_to_field(func),
+            ast::Expr::Function(func) => self.builtin_func_to_field(func),
             _ => Err(SqlgenError::Unsupported(format!(
                 "expression unsupported {}",
                 expr
@@ -577,7 +550,7 @@ impl<'a> QueryTables<'a> {
         }
     }
 
-    fn builtin_func_to_field(&self, func: &Function) -> Result<FieldDef, SqlgenError> {
+    fn builtin_func_to_field(&self, func: &ast::Function) -> Result<FieldDef, SqlgenError> {
         let name = func.name.to_string();
         match name.to_lowercase().as_str() {
             "avg" | "round" => self.infer_null_func_eager(name, func, SqlType::Float64),
@@ -839,17 +812,144 @@ impl<'a> QueryTables<'a> {
         }
     }
 
-    fn function_arg_to_field_def(&self, arg: &FunctionArg) -> Result<FieldDef, SqlgenError> {
+    fn function_arg_to_field_def(&self, arg: &ast::FunctionArg) -> Result<FieldDef, SqlgenError> {
         match arg {
-            FunctionArg::Named {
+            ast::FunctionArg::Named {
                 arg: ast::FunctionArgExpr::Expr(expr),
                 ..
             } => self.expr_to_field_def(expr),
-            FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => self.expr_to_field_def(expr),
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => {
+                self.expr_to_field_def(expr)
+            }
             _ => Err(SqlgenError::Unsupported(
                 "wildcard expressions as function args aren't supported".to_string(),
             )),
         }
+    }
+}
+
+impl TryFrom<&ast::ColumnDef> for FieldDef {
+    type Error = SqlgenError;
+
+    fn try_from(coldef: &ast::ColumnDef) -> Result<Self, Self::Error> {
+        let field_name = coldef.name.to_string();
+        let sqltype = SqlType::try_from(&coldef.data_type)?;
+        let not_null = coldef.options.iter().any(|opt| {
+            matches!(
+                opt.option,
+                ast::ColumnOption::NotNull | ast::ColumnOption::Unique { is_primary: true }
+            )
+        });
+        Ok(FieldDef {
+            name: field_name.clone(),
+            sqltype,
+            nullable: !not_null,
+        })
+    }
+}
+
+impl TryFrom<&ast::DataType> for SqlType {
+    type Error = SqlgenError;
+
+    fn try_from(value: &ast::DataType) -> Result<Self, Self::Error> {
+        match value {
+            ast::DataType::Bool | ast::DataType::Boolean => Ok(SqlType::Bool),
+            ast::DataType::TinyInt(_) => Ok(SqlType::Int8),
+            ast::DataType::SmallInt(_) | ast::DataType::Int2(_) => Ok(SqlType::Int16),
+            ast::DataType::Int4(_)
+            | ast::DataType::Integer(_)
+            | ast::DataType::MediumInt(_)
+            | ast::DataType::Int(_) => Ok(SqlType::Int32),
+            ast::DataType::BigInt(_) | ast::DataType::Int8(_) => Ok(SqlType::Int64),
+            ast::DataType::Text => Ok(SqlType::Text),
+            ast::DataType::Real | ast::DataType::Float4 => Ok(SqlType::Float32),
+            ast::DataType::Float(_)
+            | ast::DataType::Float8
+            | ast::DataType::Double
+            | ast::DataType::DoublePrecision => Ok(SqlType::Float64),
+            ast::DataType::Blob(_) => Ok(SqlType::Binary),
+            data_type => Err(SqlgenError::Unsupported(format!(
+                "data type {data_type} is not supported"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct QueryTables<'a> {
+    schema: &'a Schema,
+    temp_schema: IndexMap<String, Table>,
+    tables: IndexMap<String, Table>,
+}
+
+impl<'a> QueryTables<'a> {
+    fn new(schema: &'a Schema) -> Self {
+        Self {
+            schema,
+            temp_schema: IndexMap::new(),
+            tables: IndexMap::new(),
+        }
+    }
+
+    fn insert_temp_from_query<S: Display>(&mut self, name: S, out_query: &Query) {
+        let mut table = Table {
+            name: name.to_string(),
+            fields: IndexMap::with_capacity(out_query.projection().len()),
+        };
+        for field in out_query.projection() {
+            table.insert_field(field.name.clone(), field.clone());
+        }
+        self.temp_schema.insert(name.to_string(), table);
+    }
+
+    fn insert_table<S: Into<String>>(&mut self, name: S, table: Table) {
+        self.tables.insert(name.into(), table);
+    }
+
+    fn insert_table_from_query<S: Display>(&mut self, name: S, query: &Query) {
+        let mut table = Table {
+            name: name.to_string(),
+            fields: IndexMap::with_capacity(query.projection().len()),
+        };
+        for field in query.projection() {
+            table.insert_field(field.name.clone(), field.clone());
+        }
+        self.tables.insert(name.to_string(), table);
+    }
+
+    fn find_table_in_schema<S: AsRef<str>>(&self, table_name: S) -> Option<&Table> {
+        self.schema
+            .get_table(table_name.as_ref())
+            .or_else(|| self.temp_schema.get(table_name.as_ref()))
+    }
+
+    fn find_table<S: AsRef<str>>(&self, table_name: S) -> Option<&Table> {
+        self.tables.get(table_name.as_ref())
+    }
+
+    fn all_table_fields(&self) -> Vec<&FieldDef> {
+        self.tables
+            .values()
+            .flat_map(|t| t.get_sorted_fields())
+            .collect()
+    }
+
+    fn find_qualified_field<S: Display>(&self, name_parts: &[S]) -> Option<&FieldDef> {
+        let table_name = name_parts.first().unwrap().to_string();
+        let field_name = name_parts.last().unwrap().to_string();
+
+        self.tables
+            .get(&table_name)
+            .and_then(|table| table.find_field(&field_name))
+    }
+
+    fn find_field<S: AsRef<str>>(&self, field_name: S) -> Option<&FieldDef> {
+        for table in self.tables.values() {
+            if let Some(field) = table.find_field(field_name.as_ref()) {
+                return Some(field);
+            }
+        }
+        None
     }
 }
 
@@ -3901,6 +4001,79 @@ mod test {
         let actual = parser
             .parse_query("SELECT timediff(col_a, col_b) FROM t1;", &schema)
             .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_select_with_cte() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "field".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query(
+                "WITH cte AS (SELECT col_a field FROM t1) SELECT * FROM cte;",
+                &schema,
+            )
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_select_with_subquery() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "field".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT * FROM (SELECT col_a field FROM t1);", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_select_with_subquery_prevent_invalid_scope_access() {
+        let expected =
+            SqlgenError::EntityNotFound("table sq does not exist in known schema".to_string());
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query(
+                "SELECT * FROM (SELECT col_a field FROM t1) as sq, (SELECT * FROM sq);",
+                &schema,
+            )
+            .unwrap_err();
 
         assert_eq!(expected, actual);
     }
