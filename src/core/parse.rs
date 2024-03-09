@@ -397,7 +397,7 @@ impl Sqlparser {
                     .map(|a| a.name.to_string())
                     .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-                let subquery_out = self.parse_select_query(subquery, &query_tables)?;
+                let subquery_out = self.parse_select_query(subquery, query_tables)?;
                 query_tables.insert_table_from_query(&table_name, &subquery_out);
                 dbg!(query_tables);
                 Ok(())
@@ -621,7 +621,7 @@ impl<'a> SqliteFieldIter<'a> {
         sqltype: SqlType,
         first_arg_pos: usize,
     ) -> Result<FieldDef, SqlgenError> {
-        match func.args.iter().nth(first_arg_pos) {
+        match func.args.get(first_arg_pos) {
             Some(arg) => self.function_arg_to_field_def(arg).map(|field| FieldDef {
                 name,
                 sqltype,
