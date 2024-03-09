@@ -281,14 +281,16 @@ The following SQL is currently understood by the `sqlgen` parser - support for o
 | SELECT statements                                       | ✅        |
 | Aliases (fields and tables)                             | ✅        |
 | JOINs                                                   | ✅        |
-| CTEs                                                    | ❌        |
-| Subqueries                                              | ❌        |
+| CTEs                                                    | ✅        |
+| Subqueries                                              | ✅        |
 | Aggregate Functions (`count()`, `avg()`, etc.)          | ✅        |
-| Scalar Functions (`coalesce()`, `substr()`, etc.)       | ❌        |
+| Scalar Functions (`coalesce()`, `substr()`, etc.)       | ✅        |
 | Casting (`CAST('1' AS INT)`, or `'1'::int` in Postgres) | ❌        |
 | INSERT statemements (incl. `RETURNING`)                 | ✅        |
 | UPDATE statemements (incl. `RETURNING`)                 | ✅        |
 | DELETE statemements (incl. `RETURNING`)                 | ✅        |
+| Views                                                   | ❌        |
+| Multiple Schemas                                        | ❌        |
 
 ## Development
 
