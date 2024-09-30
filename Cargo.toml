@@ -1,6 +1,6 @@
 [package]
 name = "sqlgen"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 edition = "2021"
 authors = ["Matt Clarson<clarsgon469@gmail.com>"]
 description = "CLI tool for generating code from SQL schemas and queries"
