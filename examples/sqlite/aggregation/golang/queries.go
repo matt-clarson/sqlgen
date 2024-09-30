@@ -7,12 +7,20 @@ import (
 	"database/sql"
 )
 
+type SqlQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+type SqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 type AvgMonthlyCostPerCampaignCteResult struct {
 	Campaign       int32
 	AvgMonthlyCost float64
 }
 
-func AvgMonthlyCostPerCampaignCte(db *sql.DB, ctx context.Context) ([]AvgMonthlyCostPerCampaignCteResult, error) {
+func AvgMonthlyCostPerCampaignCte(ctx context.Context, db SqlQueryer) ([]AvgMonthlyCostPerCampaignCteResult, error) {
 	query := `
         WITH cost_by_month AS (
             SELECT
@@ -64,7 +72,7 @@ type AvgMonthlyCostPerCampaignSubqueryResult struct {
 	AvgMonthlyCost float64
 }
 
-func AvgMonthlyCostPerCampaignSubquery(db *sql.DB, ctx context.Context) ([]AvgMonthlyCostPerCampaignSubqueryResult, error) {
+func AvgMonthlyCostPerCampaignSubquery(ctx context.Context, db SqlQueryer) ([]AvgMonthlyCostPerCampaignSubqueryResult, error) {
 	query := `
         SELECT
             campaign,

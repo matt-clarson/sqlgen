@@ -7,6 +7,14 @@ import (
 	"database/sql"
 )
 
+type SqlQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+type SqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 type GetUserAndItemsArg struct {
 	Email string
 }
@@ -17,7 +25,7 @@ type GetUserAndItemsResult struct {
 	Rating   sql.NullInt32
 }
 
-func GetUserAndItems(db *sql.DB, ctx context.Context, arg GetUserAndItemsArg) ([]GetUserAndItemsResult, error) {
+func GetUserAndItems(ctx context.Context, db SqlQueryer, arg GetUserAndItemsArg) ([]GetUserAndItemsResult, error) {
 	query := `
         SELECT
             u.username,

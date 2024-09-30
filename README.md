@@ -249,7 +249,7 @@ import (
 func main() {
     var db *sql.DB = CreateDBSomehow()
 
-    rows, err := queries.GetAllUserNicknames(db, context.Background())
+    rows, err := queries.GetAllUserNicknames(context.Background(), db)
     if err != nil {
         log.Fatal(err)
     }

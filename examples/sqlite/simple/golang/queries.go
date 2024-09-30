@@ -7,11 +7,19 @@ import (
 	"database/sql"
 )
 
+type SqlQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+type SqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 type CountTable1Result struct {
 	NumRows int32
 }
 
-func CountTable1(db *sql.DB, ctx context.Context) ([]CountTable1Result, error) {
+func CountTable1(ctx context.Context, db SqlQueryer) ([]CountTable1Result, error) {
 	query := `
         SELECT
             count(*) AS num_rows
@@ -48,7 +56,7 @@ type GetJoinedResult struct {
 	OtherValue []byte
 }
 
-func GetJoined(db *sql.DB, ctx context.Context) ([]GetJoinedResult, error) {
+func GetJoined(ctx context.Context, db SqlQueryer) ([]GetJoinedResult, error) {
 	query := `
         SELECT 
             t1.id t1_id,
@@ -99,7 +107,7 @@ type GetTable1Result struct {
 	ColB string
 }
 
-func GetTable1(db *sql.DB, ctx context.Context) ([]GetTable1Result, error) {
+func GetTable1(ctx context.Context, db SqlQueryer) ([]GetTable1Result, error) {
 	query := `
         SELECT * FROM table_1;
     `
@@ -133,7 +141,7 @@ type InsertTable1Arg struct {
 	ColB string
 }
 
-func InsertTable1(db *sql.DB, ctx context.Context, arg InsertTable1Arg) error {
+func InsertTable1(ctx context.Context, db SqlExecer, arg InsertTable1Arg) error {
 	query := `
         INSERT INTO table_1
         VALUES (
@@ -163,7 +171,7 @@ type QueryJoinedResult struct {
 	SomeValue sql.NullFloat64
 }
 
-func QueryJoined(db *sql.DB, ctx context.Context, arg QueryJoinedArg) ([]QueryJoinedResult, error) {
+func QueryJoined(ctx context.Context, db SqlQueryer, arg QueryJoinedArg) ([]QueryJoinedResult, error) {
 	query := `
         SELECT
             t1.id t1_id,

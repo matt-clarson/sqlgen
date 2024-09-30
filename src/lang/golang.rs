@@ -86,6 +86,16 @@ impl GoCodegen {
         s.push_str("\t\"context\"\n");
         s.push_str("\t\"database/sql\"\n");
         s.push_str(")\n\n");
+        s.push_str("type SqlQueryer interface {\n");
+        s.push_str(
+            "\tQueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)\n",
+        );
+        s.push_str("}\n\n");
+        s.push_str("type SqlExecer interface {\n");
+        s.push_str(
+            "\tExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)\n",
+        );
+        s.push_str("}\n\n");
     }
 
     fn arg_type(&self, s: &mut String, named_query: &NamedQuery) {
@@ -152,6 +162,8 @@ impl GoCodegen {
     }
 
     fn function(&self, s: &mut String, named_query: &NamedQuery) {
+        let query_has_result = !named_query.query().projection().is_empty();
+        let query_has_args = !named_query.args().is_empty();
         let function_name = pascal_case(named_query.name());
         let mut result_name = pascal_case(named_query.name());
         result_name.push_str("Result");
@@ -160,41 +172,30 @@ impl GoCodegen {
 
         s.push_str("func ");
         s.push_str(function_name.as_str());
-        s.push_str("(db *sql.DB, ctx context.Context");
-        if !named_query.args().is_empty() {
+        if query_has_result {
+            s.push_str("(ctx context.Context, db SqlQueryer");
+        } else {
+            s.push_str("(ctx context.Context, db SqlExecer");
+        }
+        if query_has_args {
             s.push_str(", arg ");
             s.push_str(arg_name.as_str());
         }
         s.push_str(") ");
-        if named_query.query().projection().is_empty() {
-            s.push_str("error {\n");
-        } else {
+        if query_has_result {
             s.push_str("([]");
             s.push_str(result_name.as_str());
             s.push_str(", error) {\n");
+        } else {
+            s.push_str("error {\n");
         }
         s.push_str("\tquery := `\n");
         s.push_str(indent_lines(named_query.raw(), "        ").as_str());
         s.push('\n');
         s.push_str("    `\n\n");
 
-        if named_query.query().projection().is_empty() {
-            if named_query.args().is_empty() {
-                s.push_str("\t_, err := db.ExecContext(ctx, query)\n\n");
-            } else {
-                s.push_str("\t_, err := db.ExecContext(ctx, query,\n");
-                for arg in named_query.args() {
-                    s.push_str("\t\targ.");
-                    s.push_str(pascal_case(arg.ident()).as_str());
-                    s.push_str(",\n");
-                }
-                s.push_str("\t)\n\n");
-            }
-            s.push_str("\treturn err\n");
-        } else {
-            if named_query.args().is_empty() {
-                s.push_str("\trows, err := db.QueryContext(ctx, query)\n");
-            } else {
+        if query_has_result {
+            if query_has_args {
                 s.push_str("\trows, err := db.QueryContext(ctx, query,\n");
                 for arg in named_query.args() {
                     s.push_str("\t\targ.");
@@ -202,6 +203,8 @@ impl GoCodegen {
                     s.push_str(",\n")
                 }
                 s.push_str("\t)\n");
+            } else {
+                s.push_str("\trows, err := db.QueryContext(ctx, query)\n");
             }
             s.push_str("\tif err != nil {\n");
             s.push_str("\t\treturn nil, err\n");
@@ -229,6 +232,19 @@ impl GoCodegen {
             s.push_str("\t}\n\n");
 
             s.push_str("\treturn results, rows.Err()\n");
+        } else {
+            if query_has_args {
+                s.push_str("\t_, err := db.ExecContext(ctx, query,\n");
+                for arg in named_query.args() {
+                    s.push_str("\t\targ.");
+                    s.push_str(pascal_case(arg.ident()).as_str());
+                    s.push_str(",\n");
+                }
+                s.push_str("\t)\n\n");
+            } else {
+                s.push_str("\t_, err := db.ExecContext(ctx, query)\n\n");
+            }
+            s.push_str("\treturn err\n");
         }
 
         s.push_str("}\n\n");
