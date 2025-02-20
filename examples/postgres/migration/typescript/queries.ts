@@ -50,7 +50,7 @@ export async function getUserAndItems(
                 LEFT JOIN user_items ui ON u.id=ui.user
                 LEFT JOIN items i ON ui.item=i.id
         WHERE
-            u.email = ?;
+            u.email = $1;
     `;
 
     const result = await dispatch(query, [

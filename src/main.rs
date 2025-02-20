@@ -25,10 +25,30 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Copy, Clone, clap::ValueEnum)]
+enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+impl From<Dialect> for SqlDialect {
+    fn from(value: Dialect) -> Self {
+        match value {
+            Dialect::Sqlite => SqlDialect::Sqlite,
+            Dialect::Postgres => SqlDialect::Postgres,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Generate go code for the given schema and queries.
     Golang {
+        /// The SQL dialect to use - affects how arguments bindings are rendered and what
+        /// types/functions are available.
+        #[arg(short, long)]
+        dialect: Dialect,
+
         /// The sql schema file to use. Either this option OR --migration_dir must be provided.
         #[arg(short, long, value_name = "FILE")]
         schema: Option<PathBuf>,
@@ -58,6 +78,11 @@ enum Command {
     },
     /// Generate typescript code for the given schema and queries.
     Typescript {
+        /// The SQL dialect to use - affects how arguments bindings are rendered and what
+        /// types/functions are available.
+        #[arg(short, long)]
+        dialect: Dialect,
+
         /// The sql schema file to use. Either this option OR --migration_dir must be provided.
         #[arg(short, long, value_name = "FILE")]
         schema: Option<PathBuf>,
@@ -83,6 +108,7 @@ fn main() -> io::Result<()> {
 
     match cli.command {
         Command::Golang {
+            dialect,
             schema,
             migration_dir,
             queries_dir,
@@ -90,7 +116,6 @@ fn main() -> io::Result<()> {
         } => {
             let schema = load_schema(schema, migration_dir)?;
             let queries = Files::new(queries_dir, SqlFileFilter {})?;
-            let dialect = SqlDialect::Sqlite;
 
             let mut out: Box<dyn io::Write> = match &outfile {
                 Some(path) => {
@@ -109,7 +134,7 @@ fn main() -> io::Result<()> {
                 schema,
                 queries,
                 code_generator,
-                dialect,
+                dialect: dialect.into(),
             };
             match sqlgen.run() {
                 Ok(s) => out.write_all(s.as_bytes()),
@@ -120,6 +145,7 @@ fn main() -> io::Result<()> {
             }
         }
         Command::Typescript {
+            dialect,
             schema,
             migration_dir,
             queries_dir,
@@ -128,7 +154,6 @@ fn main() -> io::Result<()> {
         } => {
             let schema = load_schema(schema, migration_dir)?;
             let queries = Files::new(queries_dir, SqlFileFilter {})?;
-            let dialect = SqlDialect::Sqlite;
 
             let mut out: Box<dyn io::Write> = match outfile {
                 Some(path) => {
@@ -143,7 +168,7 @@ fn main() -> io::Result<()> {
                 schema,
                 queries,
                 code_generator: TSCodegen {},
-                dialect,
+                dialect: dialect.into(),
             };
             match sqlgen.run() {
                 Ok(s) => out.write_all(s.as_bytes()),

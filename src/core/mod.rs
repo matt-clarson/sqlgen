@@ -23,6 +23,7 @@ use self::parse::Sqlparser;
 #[derive(Clone, Copy, Debug)]
 pub enum SqlDialect {
     Sqlite,
+    Postgres,
 }
 
 pub type QueriesResult<R> = Result<FilesEntry<R>, FilesError>;
@@ -97,12 +98,13 @@ fn replace<S: AsRef<str>>(sql: S, dialect: SqlDialect, args: &[argparse::Arg]) -
 
     let mut pos = 0;
 
-    let mut out = args.iter().fold(String::new(), |acc, x| {
+    let mut out = args.iter().enumerate().fold(String::new(), |acc, (i, x)| {
         let binding = match dialect {
-            SqlDialect::Sqlite => "?",
+            SqlDialect::Sqlite => "?".to_string(),
+            SqlDialect::Postgres => format!("${}", i + 1),
         };
 
-        let next = acc + &s[pos..x.pos()] + binding;
+        let next = acc + &s[pos..x.pos()] + &binding;
 
         pos = x.pos() + x.len();
 

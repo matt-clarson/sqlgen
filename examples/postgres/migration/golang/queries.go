@@ -36,7 +36,7 @@ func GetUserAndItems(ctx context.Context, db SqlQueryer, arg GetUserAndItemsArg)
                 LEFT JOIN user_items ui ON u.id=ui.user
                 LEFT JOIN items i ON ui.item=i.id
         WHERE
-            u.email = ?;
+            u.email = $1;
     `
 
 	rows, err := db.QueryContext(ctx, query,
