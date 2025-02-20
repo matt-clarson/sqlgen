@@ -34,9 +34,9 @@ WHERE email = $email::text;
 Finally, run `sqlgen` to produce typed code:
 
 ```sh
-sqlgen typescript -s ./schema.sql -q ./queries/ > my-queries.ts
+sqlgen typescript -d sqlite -s ./schema.sql -q ./queries/ > my-queries.ts
 # or use the -o flag for an output file
-sqlgen typescript -s ./schema.sql -q ./queries. -o my-queries.ts
+sqlgen typescript -d sqlite -s ./schema.sql -q ./queries. -o my-queries.ts
 ```
 
 To see all the CLI options, run:
@@ -224,6 +224,7 @@ VALUES (
 
 | Name                   | Required | Description                                                                                                                                                                                          |
 | ---------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-d` `--dialect`        | Yes       | The sql dialect to use.
 | `-s` `--schema`        | No       | The sql schema file to use. One of `--schema` or `--migration-dir` must be provided.                                                                                                                 |
 | `-m` `--migration-dir` | No       | A directory of migration files to use. Only files ending in `.up.sql` will be used, and files will be read in ascending alphanumeric order. One of `--schema` or `--migration-dir` must be provided. |
 | `-q` `--queries-dir`   | Yes      | A directory containing sql queries.                                                                                                                                                                  |
@@ -237,6 +238,7 @@ To use the generated code, a `Dispatcher` implementation should be created. You 
 
 | Name                   | Required | Description                                                                                                                                                                                                                                                                                                        |
 | ---------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `-d` `--dialect`        | Yes       | The sql dialect to use.
 | `-s` `--schema`        | No       | The sql schema file to use. One of `--schema` or `--migration-dir` must be provided.                                                                                                                                                                                                                               |
 | `-m` `--migration-dir` | No       | A directory of migration files to use. Only files ending in `.up.sql` will be used, and files will be read in ascending alphanumeric order. One of `--schema` or `--migration-dir` must be provided.                                                                                                               |
 | `-q` `--queries-dir`   | Yes      | A directory containing sql queries.                                                                                                                                                                                                                                                                                |
@@ -257,7 +259,7 @@ import (
     "mypkg/queries"
 )
 
-//go:generate sqlgen golang -s sql/schema.sql -q sql/queries/ -o queries/queries.go
+//go:generate sqlgen golang -d sqlite -s sql/schema.sql -q sql/queries/ -o queries/queries.go
 
 func main() {
     var db *sql.DB = CreateDBSomehow()
@@ -283,7 +285,7 @@ The following dialects are supported by `sqlgen` - any dialects not listed are n
 | -------- | --------- |
 | Sqlite   | ✅        |
 | MySQL    | ❌        |
-| Postgres | ❌        |
+| Postgres | ✅        |
 
 #### Spec
 

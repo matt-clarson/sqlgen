@@ -16,7 +16,7 @@ impl Codegen for GoCodegen {
         let mut out = String::new();
 
         self.header_comment(&mut out);
-        self.base_types(&mut out);
+        self.base_types(&mut out, named_queries);
 
         for named_query in named_queries {
             if !named_query.args().is_empty() {
@@ -78,13 +78,16 @@ impl GoCodegen {
         s.push_str("\n\n");
     }
 
-    fn base_types(&self, s: &mut String) {
+    fn base_types(&self, s: &mut String, named_queries: &[NamedQuery]) {
         s.push_str("package ");
         s.push_str(self.package.as_str());
         s.push_str("\n\n");
         s.push_str("import (\n");
         s.push_str("\t\"context\"\n");
         s.push_str("\t\"database/sql\"\n");
+        if self.has_time(named_queries) {
+            s.push_str("\t\"time\"\n");
+        }
         s.push_str(")\n\n");
         s.push_str("type SqlQueryer interface {\n");
         s.push_str(
@@ -96,6 +99,19 @@ impl GoCodegen {
             "\tExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)\n",
         );
         s.push_str("}\n\n");
+    }
+
+    fn has_time(&self, queries: &[NamedQuery]) -> bool {
+        queries.iter().any(|query| {
+            query.query().projection().iter().any(|field_def| {
+                matches!(field_def.sql_type(), SqlType::DateTime) && !field_def.nullable()
+            }) || query.args().iter().any(|arg| {
+                matches!(
+                    arg.arg_type(),
+                    Some(ArgType::NonNullable(SqlType::DateTime))
+                )
+            })
+        })
     }
 
     fn arg_type(&self, s: &mut String, named_query: &NamedQuery) {
@@ -157,9 +173,9 @@ impl GoCodegen {
                 s.push(' ');
             }
             if field.nullable() {
-                s.push_str(field.sqltype().into_null_str());
+                s.push_str(field.sql_type().into_null_str());
             } else {
-                s.push_str(field.sqltype().into_strict_str());
+                s.push_str(field.sql_type().into_strict_str());
             }
             s.push('\n')
         }
@@ -274,6 +290,16 @@ impl StrictSqlTypeExt for SqlType {
             SqlType::Float32 | SqlType::Float64 => "float64",
             SqlType::Text => "string",
             SqlType::Binary => "[]byte",
+            SqlType::DateTime => "time.Time",
+            SqlType::BoolArray => "[]bool",
+            SqlType::Int8Array => "[]int8",
+            SqlType::Int16Array => "[]int16",
+            SqlType::Int32Array => "[]int32",
+            SqlType::Int64Array => "[]int64",
+            SqlType::Float32Array | SqlType::Float64Array => "[]float64",
+            SqlType::TextArray => "[]string",
+            #[allow(unreachable_patterns)]
+            _ => unimplemented!("type {:?} not implemented for golang", self),
         }
     }
 }
@@ -289,6 +315,16 @@ impl NullableSqlTypeExt for SqlType {
             SqlType::Float32 | SqlType::Float64 => "sql.NullFloat64",
             SqlType::Text => "sql.NullString",
             SqlType::Binary => "[]byte",
+            SqlType::DateTime => "sql.NullTime",
+            SqlType::BoolArray => "[]bool",
+            SqlType::Int8Array => "[]int8",
+            SqlType::Int16Array => "[]int16",
+            SqlType::Int32Array => "[]int32",
+            SqlType::Int64Array => "[]int64",
+            SqlType::Float32Array | SqlType::Float64Array => "[]float64",
+            SqlType::TextArray => "[]string",
+            #[allow(unreachable_patterns)]
+            _ => unimplemented!("type {:?} not implemented for golang", self),
         }
     }
 }

@@ -6,12 +6,13 @@ use uuid::Uuid;
 
 use crate::error::SqlgenError;
 
-use super::argparse;
+use super::{argparse, SqlDialect};
 
 impl From<&super::SqlDialect> for Parser<'_> {
     fn from(dialect: &super::SqlDialect) -> Self {
         match dialect {
             super::SqlDialect::Sqlite => Parser::new(&dialect::SQLiteDialect {}),
+            super::SqlDialect::Postgres => Parser::new(&dialect::PostgreSqlDialect {}),
         }
     }
 }
@@ -107,6 +108,28 @@ impl Table {
     pub fn delete_field<S: AsRef<str>>(&mut self, name: S) -> Option<FieldDef> {
         self.fields.shift_remove(name.as_ref())
     }
+
+    fn to_nullable(&self) -> Self {
+        let fields = self
+            .fields
+            .iter()
+            .map(|(name, field)| {
+                (
+                    name.to_owned(),
+                    FieldDef {
+                        name: field.name.clone(),
+                        sqltype: field.sqltype,
+                        nullable: true,
+                    },
+                )
+            })
+            .collect::<IndexMap<_, _>>();
+
+        Self {
+            name: self.name.clone(),
+            fields,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -160,7 +183,7 @@ impl FieldDef {
         self.name.as_ref()
     }
 
-    pub fn sqltype(&self) -> SqlType {
+    pub fn sql_type(&self) -> SqlType {
         self.sqltype
     }
 
@@ -169,6 +192,7 @@ impl FieldDef {
     }
 }
 
+#[non_exhaustive]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SqlType {
     Bool,
@@ -180,6 +204,15 @@ pub enum SqlType {
     Int64,
     Text,
     Binary,
+    DateTime,
+    BoolArray,
+    Float32Array,
+    Float64Array,
+    Int8Array,
+    Int16Array,
+    Int32Array,
+    Int64Array,
+    TextArray,
 }
 
 #[derive(Debug)]
@@ -307,10 +340,10 @@ impl Sqlparser {
                 ..
             } => {
                 let mut query_tables = QueryTables::new(schema);
-                for join in &table.joins {
-                    self.try_store_query_table_factor(&mut query_tables, &join.relation)?;
-                }
                 self.try_store_query_table_factor(&mut query_tables, &table.relation)?;
+                for join in &table.joins {
+                    self.try_store_joined_table(&mut query_tables, join)?;
+                }
 
                 for field in SqliteFieldIter::new(&query_tables, projection) {
                     out_query.projection.push(field?);
@@ -327,13 +360,13 @@ impl Sqlparser {
             } => {
                 let mut query_tables = QueryTables::new(schema);
                 for table_with_joins in from {
-                    for join in &table_with_joins.joins {
-                        self.try_store_query_table_factor(&mut query_tables, &join.relation)?;
-                    }
                     self.try_store_query_table_factor(
                         &mut query_tables,
                         &table_with_joins.relation,
                     )?;
+                    for join in &table_with_joins.joins {
+                        self.try_store_joined_table(&mut query_tables, join)?;
+                    }
                 }
 
                 for field in SqliteFieldIter::new(&query_tables, projection) {
@@ -408,6 +441,78 @@ impl Sqlparser {
         }
     }
 
+    fn try_store_joined_table(
+        &self,
+        query_tables: &mut QueryTables,
+        joined_table: &ast::Join,
+    ) -> Result<(), SqlgenError> {
+        let (table_name, table) = match &joined_table.relation {
+            ast::TableFactor::Table { name, alias, .. } => {
+                let table_name = alias
+                    .as_ref()
+                    .map(|a| a.name.to_string())
+                    .unwrap_or_else(|| name.0.last().unwrap().to_string());
+                query_tables
+                    .find_table_in_schema(name.to_string())
+                    .cloned()
+                    .map(|table| (table_name, table))
+                    .ok_or_else(|| {
+                        SqlgenError::EntityNotFound(format!(
+                            "table {name} does not exist in known schema"
+                        ))
+                    })
+            }
+            ast::TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let query = self.parse_select_query(subquery, query_tables)?;
+                let table_name = alias
+                    .as_ref()
+                    .map(|a| a.name.to_string())
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+                let mut table = Table {
+                    name: table_name.to_string(),
+                    fields: IndexMap::with_capacity(query.projection().len()),
+                };
+                for field in query.projection() {
+                    table.insert_field(field.name.clone(), field.clone());
+                }
+                Ok((table_name, table))
+            }
+            _ => Err(SqlgenError::Unsupported(
+                "only named table expressions and subqueries are supported in FROM clauses"
+                    .to_string(),
+            )),
+        }?;
+
+        match joined_table.join_operator {
+            ast::JoinOperator::Inner(_) => {
+                query_tables.insert_table(table_name, table);
+                Ok(())
+            }
+            ast::JoinOperator::LeftOuter(_) => {
+                let table = table.to_nullable();
+                query_tables.insert_table(table_name, table.to_nullable());
+                Ok(())
+            }
+            ast::JoinOperator::FullOuter(_) => {
+                query_tables.nullify_all_tables();
+                query_tables.insert_table(table_name, table.to_nullable());
+                Ok(())
+            }
+            ast::JoinOperator::RightOuter(_) => {
+                query_tables.nullify_all_tables();
+                query_tables.insert_table(table_name, table);
+                Ok(())
+            }
+            _ => Err(SqlgenError::Unsupported(
+                "only INNER, LEFT [OUTER], FULL [OUTER], and RIGHT [OUTER] joins are supported"
+                    .to_string(),
+            )),
+        }
+    }
+
     fn parse_to_statements<S: AsRef<str>>(
         &self,
         sql: S,
@@ -434,23 +539,44 @@ impl Sqlparser {
             }
         }
 
-        match query.body.as_ref() {
+        self.parse_query_set_expression(query.body.as_ref(), &mut query_tables, &mut out_query)?;
+
+        Ok(out_query)
+    }
+
+    fn parse_query_set_expression(
+        &self,
+        set_expr: &ast::SetExpr,
+        query_tables: &mut QueryTables,
+        out_query: &mut Query,
+    ) -> Result<(), SqlgenError> {
+        match set_expr {
             ast::SetExpr::Select(select) => {
                 for table_with_joins in &select.from {
+                    self.try_store_query_table_factor(query_tables, &table_with_joins.relation)?;
                     for join in &table_with_joins.joins {
-                        self.try_store_query_table_factor(&mut query_tables, &join.relation)?;
+                        self.try_store_joined_table(query_tables, join)?;
                     }
-                    self.try_store_query_table_factor(
-                        &mut query_tables,
-                        &table_with_joins.relation,
-                    )?;
                 }
 
-                for field in SqliteFieldIter::new(&query_tables, &select.projection) {
+                let field_iter: Box<dyn Iterator<Item = Result<FieldDef, SqlgenError>>> =
+                    match self.dialect {
+                        SqlDialect::Sqlite => {
+                            Box::new(SqliteFieldIter::new(query_tables, &select.projection))
+                        }
+                        SqlDialect::Postgres => {
+                            Box::new(PostgresFieldIter::new(query_tables, &select.projection))
+                        }
+                    };
+
+                for field in field_iter {
                     out_query.projection.push(field?);
                 }
 
-                Ok(out_query)
+                Ok(())
+            }
+            ast::SetExpr::SetOperation { left, .. } => {
+                self.parse_query_set_expression(left.as_ref(), query_tables, out_query)
             }
             _ => Err(SqlgenError::Unsupported(
                 "only SELECT, UPDATE, INSERT, and DELETE statements are supported in queries"
@@ -466,7 +592,7 @@ struct SqliteFieldIter<'a> {
     current: Option<Box<dyn Iterator<Item = FieldDef> + 'a>>,
 }
 
-impl<'a> Iterator for SqliteFieldIter<'a> {
+impl Iterator for SqliteFieldIter<'_> {
     type Item = Result<FieldDef, SqlgenError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -533,11 +659,13 @@ impl<'a> SqliteFieldIter<'a> {
         match expr {
             ast::Expr::Identifier(ident) => self
                 .query_tables
-                .find_field(&ident.value).cloned()
+                .find_field(&ident.value)
+                .cloned()
                 .ok_or_else(|| SqlgenError::EntityNotFound(ident.to_string())),
             ast::Expr::CompoundIdentifier(idents) => self
                 .query_tables
-                .find_qualified_field(idents).cloned()
+                .find_qualified_field(idents)
+                .cloned()
                 .ok_or_else(|| SqlgenError::EntityNotFound(compound_name(idents))),
             ast::Expr::Function(func) => self.builtin_func_to_field(func),
             _ => Err(SqlgenError::Unsupported(format!(
@@ -825,6 +953,385 @@ impl<'a> SqliteFieldIter<'a> {
     }
 }
 
+struct PostgresFieldIter<'a> {
+    query_tables: &'a QueryTables<'a>,
+    select_items: Box<dyn Iterator<Item = &'a ast::SelectItem> + 'a>,
+    current: Option<Box<dyn Iterator<Item = FieldDef> + 'a>>,
+}
+
+impl Iterator for PostgresFieldIter<'_> {
+    type Item = Result<FieldDef, SqlgenError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.current
+            .as_mut()
+            .and_then(|iter| Ok(iter.next()).transpose())
+            .or_else(|| {
+                self.select_items.next().and_then(|item| {
+                    self.get_fields_for_select_item(item)
+                        .map(|mut next_iter| {
+                            let next = next_iter.next();
+                            self.current = Some(next_iter);
+                            next
+                        })
+                        .transpose()
+                })
+            })
+    }
+}
+
+impl<'a> PostgresFieldIter<'a> {
+    fn new(query_tables: &'a QueryTables, select_items: &'a [ast::SelectItem]) -> Self {
+        Self {
+            current: None,
+            query_tables,
+            select_items: Box::new(select_items.iter()),
+        }
+    }
+
+    fn get_fields_for_select_item(
+        &self,
+        select_item: &ast::SelectItem,
+    ) -> Result<Box<dyn Iterator<Item = FieldDef> + 'a>, SqlgenError> {
+        match select_item {
+            ast::SelectItem::Wildcard(_) => {
+                let iter = self.query_tables.all_table_fields().into_iter().cloned();
+                Ok(Box::new(iter))
+            }
+            ast::SelectItem::QualifiedWildcard(table_name, _) => {
+                let name = table_name.to_string();
+                if let Some(table) = self.query_tables.find_table(&name) {
+                    let iter = table.get_sorted_fields().into_iter().cloned();
+                    Ok(Box::new(iter))
+                } else {
+                    Err(SqlgenError::EntityNotFound(name))
+                }
+            }
+            ast::SelectItem::UnnamedExpr(expr) => self.expr_to_field_def(expr).map(|field| {
+                let iter: Box<dyn Iterator<Item = FieldDef> + 'a> =
+                    Box::new(Singleton::from(field));
+                iter
+            }),
+            ast::SelectItem::ExprWithAlias { expr, alias } => {
+                self.expr_to_field_def(expr).map(|field| {
+                    let iter: Box<dyn Iterator<Item = FieldDef> + 'a> =
+                        Box::new(Singleton::from(field.clone_with_alias(alias)));
+                    iter
+                })
+            }
+        }
+    }
+
+    fn expr_to_field_def(&self, expr: &ast::Expr) -> Result<FieldDef, SqlgenError> {
+        match expr {
+            ast::Expr::Identifier(ident) => self
+                .query_tables
+                .find_field(&ident.value)
+                .cloned()
+                .ok_or_else(|| SqlgenError::EntityNotFound(ident.to_string())),
+            ast::Expr::CompoundIdentifier(idents) => self
+                .query_tables
+                .find_qualified_field(idents)
+                .cloned()
+                .ok_or_else(|| SqlgenError::EntityNotFound(compound_name(idents))),
+            ast::Expr::Function(func) => self.builtin_func_to_field(func),
+            _ => Err(SqlgenError::Unsupported(format!(
+                "expression unsupported {}",
+                expr
+            ))),
+        }
+    }
+
+    // TODO: test/check builtin functions defined here as they have been copied from the
+    // SqliteFieldIter impl
+    fn builtin_func_to_field(&self, func: &ast::Function) -> Result<FieldDef, SqlgenError> {
+        let name = func.name.to_string();
+        match name.to_lowercase().as_str() {
+            "avg" | "round" => self.infer_null_func_eager(name, func, SqlType::Float64),
+            "lower" | "ltrim" | "replace" | "rtrim" | "upper" => {
+                self.infer_null_func_unary(name, func, SqlType::Text)
+            }
+            "changes" | "count" | "last_insert_rowid" | "random" | "total_changes" => {
+                Ok(FieldDef {
+                    name,
+                    sqltype: SqlType::Int32,
+                    nullable: false,
+                })
+            }
+            "char" | "concat" | "concat_ws" | "format" | "group_concat" | "hex" | "printf"
+            | "quote" | "typeof" => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Text,
+                nullable: false,
+            }),
+            "glob" => self.infer_null_func_greedy(name, func, SqlType::Bool),
+            "instr" => self.infer_null_func_greedy(name, func, SqlType::Int32),
+            "length" | "octet_length" => self.infer_null_func_unary(name, func, SqlType::Int32),
+            "unicode" => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Int32,
+                nullable: true,
+            }),
+            "randomblob" | "zeroblob" => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Binary,
+                nullable: false,
+            }),
+            "total" => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Float64,
+                nullable: false,
+            }),
+            "unhex" => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Binary,
+                nullable: true,
+            }),
+            "coalesce" | "ifnull" | "max" | "min" | "nullif" => {
+                self.no_map_func_eager(name, func, 0)
+            }
+            "iif" => self.no_map_func_eager(name, func, 1),
+            "abs" | "sum" => self.infer_postgres_numeric_func(name, func),
+            "substr" => self.nullable_text_binary_func(name, func),
+            "timediff" => self.infer_null_func_greedy(name, func, SqlType::Text),
+            "unnest" => self.infer_postgres_unnest_func(name, func),
+            "date_trunc" => Ok(FieldDef {
+                name,
+                sqltype: SqlType::DateTime,
+                nullable: false,
+            }),
+            _ => Err(SqlgenError::Unsupported(format!(
+                "function {} is not supported",
+                func.name
+            ))),
+        }
+    }
+
+    fn infer_null_func_unary(
+        &self,
+        name: String,
+        func: &ast::Function,
+        sqltype: SqlType,
+    ) -> Result<FieldDef, SqlgenError> {
+        match func.args.first() {
+            Some(arg) => self.function_arg_to_field_def(arg).map(|field| FieldDef {
+                name,
+                sqltype,
+                nullable: field.nullable,
+            }),
+            None => Err(SqlgenError::Unknown(format!(
+                "{name} function called with invalid args - expected a single column identifier"
+            ))),
+        }
+    }
+
+    fn infer_null_func_eager(
+        &self,
+        name: String,
+        func: &ast::Function,
+        sqltype: SqlType,
+    ) -> Result<FieldDef, SqlgenError> {
+        self.no_map_func_eager(name, func, 0).map(|field| FieldDef {
+            name: field.name,
+            sqltype,
+            nullable: field.nullable,
+        })
+    }
+
+    fn infer_null_func_greedy(
+        &self,
+        name: String,
+        func: &ast::Function,
+        sqltype: SqlType,
+    ) -> Result<FieldDef, SqlgenError> {
+        self.no_map_func_greedy(name, func, 0)
+            .map(|field| FieldDef {
+                name: field.name,
+                sqltype,
+                nullable: field.nullable,
+            })
+    }
+
+    fn no_map_func_eager(
+        &self,
+        name: String,
+        func: &ast::Function,
+        num_to_skip: usize,
+    ) -> Result<FieldDef, SqlgenError> {
+        let folded = func
+            .args
+            .iter()
+            .skip(num_to_skip)
+            .fold(None, |acc, arg| match acc {
+                Some(Ok(
+                    prev_field @ FieldDef {
+                        nullable: false, ..
+                    },
+                )) => Some(Ok(prev_field)),
+                Some(Ok(_)) | None => Some(self.function_arg_to_field_def(arg)),
+                Some(err) => Some(err),
+            });
+
+        match folded {
+            Some(result) => result.map(|field| field.clone_with_alias(name)),
+            None => Err(SqlgenError::Unknown(format!(
+                "{name} function called with invalid args - expected a single column identifier"
+            ))),
+        }
+    }
+
+    fn no_map_func_greedy(
+        &self,
+        name: String,
+        func: &ast::Function,
+        num_to_skip: usize,
+    ) -> Result<FieldDef, SqlgenError> {
+        let folded = func
+            .args
+            .iter()
+            .skip(num_to_skip)
+            .fold(None, |acc, arg| match acc {
+                Some(Ok(prev_field @ FieldDef { nullable: true, .. })) => Some(Ok(prev_field)),
+                Some(Ok(_)) | None => Some(self.function_arg_to_field_def(arg)),
+                Some(err) => Some(err),
+            });
+
+        match folded {
+            Some(result) => result.map(|field| field.clone_with_alias(name)),
+            None => Err(SqlgenError::Unknown(format!(
+                "{name} function called with invalid args - expected a single column identifier"
+            ))),
+        }
+    }
+
+    fn infer_postgres_numeric_func(
+        &self,
+        name: String,
+        func: &ast::Function,
+    ) -> Result<FieldDef, SqlgenError> {
+        self.no_map_func_eager(name, func, 0)
+            .map(|field| match field.sqltype {
+                SqlType::Int8
+                | SqlType::Int16
+                | SqlType::Int32
+                | SqlType::Int64
+                | SqlType::Bool => FieldDef {
+                    name: field.name,
+                    sqltype: SqlType::Int32,
+                    nullable: field.nullable,
+                },
+                _ => FieldDef {
+                    name: field.name,
+                    sqltype: SqlType::Float64,
+                    nullable: field.nullable,
+                },
+            })
+    }
+
+    fn infer_postgres_unnest_func(
+        &self,
+        name: String,
+        func: &ast::Function,
+    ) -> Result<FieldDef, SqlgenError> {
+        let field = match func.args.first() {
+            Some(arg) => self.function_arg_to_field_def(arg),
+            None => Err(SqlgenError::Unknown(format!(
+                "{name} function called with invalid args - expected a single column identifier"
+            ))),
+        }?;
+
+        match field.sqltype {
+            SqlType::BoolArray => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Bool,
+                nullable: false,
+            }),
+            SqlType::Int8Array => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Int8,
+                nullable: false,
+            }),
+            SqlType::Int16Array => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Int16,
+                nullable: false,
+            }),
+            SqlType::Int32Array => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }),
+            SqlType::Int64Array => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Int64,
+                nullable: false,
+            }),
+            SqlType::Float32Array => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Float32,
+                nullable: false,
+            }),
+            SqlType::Float64Array => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Float64,
+                nullable: false,
+            }),
+            SqlType::TextArray => Ok(FieldDef {
+                name,
+                sqltype: SqlType::Text,
+                nullable: false,
+            }),
+            _ => Err(SqlgenError::Unsupported(
+                "cannot unnest non-array type".to_string(),
+            )),
+        }
+    }
+
+    fn nullable_text_binary_func(
+        &self,
+        name: String,
+        func: &ast::Function,
+    ) -> Result<FieldDef, SqlgenError> {
+        match func.args.first() {
+            Some(arg) => match self.function_arg_to_field_def(arg) {
+                Ok(
+                    field @ FieldDef {
+                        sqltype: SqlType::Binary,
+                        ..
+                    },
+                ) => Ok(FieldDef {
+                    name,
+                    sqltype: field.sqltype,
+                    nullable: field.nullable,
+                }),
+                Ok(field) => Ok(FieldDef {
+                    name,
+                    sqltype: SqlType::Text,
+                    nullable: field.nullable,
+                }),
+                Err(err) => Err(err),
+            },
+            None => Err(SqlgenError::Unknown(format!(
+                "{name} function called with invalid args - expected a single column identifier"
+            ))),
+        }
+    }
+
+    fn function_arg_to_field_def(&self, arg: &ast::FunctionArg) -> Result<FieldDef, SqlgenError> {
+        match arg {
+            ast::FunctionArg::Named {
+                arg: ast::FunctionArgExpr::Expr(expr),
+                ..
+            } => self.expr_to_field_def(expr),
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => {
+                self.expr_to_field_def(expr)
+            }
+            _ => Err(SqlgenError::Unsupported(
+                "wildcard expressions as function args aren't supported".to_string(),
+            )),
+        }
+    }
+}
 impl TryFrom<&ast::ColumnDef> for FieldDef {
     type Error = SqlgenError;
 
@@ -848,8 +1355,8 @@ impl TryFrom<&ast::ColumnDef> for FieldDef {
 impl TryFrom<&ast::DataType> for SqlType {
     type Error = SqlgenError;
 
-    fn try_from(value: &ast::DataType) -> Result<Self, Self::Error> {
-        match value {
+    fn try_from(data_type: &ast::DataType) -> Result<Self, Self::Error> {
+        match data_type {
             ast::DataType::Bool | ast::DataType::Boolean => Ok(SqlType::Bool),
             ast::DataType::TinyInt(_) => Ok(SqlType::Int8),
             ast::DataType::SmallInt(_) | ast::DataType::Int2(_) => Ok(SqlType::Int16),
@@ -858,14 +1365,47 @@ impl TryFrom<&ast::DataType> for SqlType {
             | ast::DataType::MediumInt(_)
             | ast::DataType::Int(_) => Ok(SqlType::Int32),
             ast::DataType::BigInt(_) | ast::DataType::Int8(_) => Ok(SqlType::Int64),
-            ast::DataType::Text => Ok(SqlType::Text),
+            ast::DataType::Text
+            | ast::DataType::Varchar(_)
+            | ast::DataType::Char(_)
+            | ast::DataType::CharVarying(_)
+            | ast::DataType::CharacterVarying(_)
+            | ast::DataType::Uuid => Ok(SqlType::Text),
             ast::DataType::Real | ast::DataType::Float4 => Ok(SqlType::Float32),
             ast::DataType::Float(_)
             | ast::DataType::Float8
             | ast::DataType::Double
             | ast::DataType::DoublePrecision => Ok(SqlType::Float64),
-            ast::DataType::Blob(_) => Ok(SqlType::Binary),
-            data_type => Err(SqlgenError::Unsupported(format!(
+            ast::DataType::Blob(_) | ast::DataType::Bytea => Ok(SqlType::Binary),
+            ast::DataType::Date
+            | ast::DataType::Datetime(_)
+            | ast::DataType::Time(_, _)
+            | ast::DataType::Timestamp(_, _) => Ok(SqlType::DateTime),
+            ast::DataType::Array(Some(inner)) => match **inner {
+                ast::DataType::Bool | ast::DataType::Boolean => Ok(SqlType::BoolArray),
+                ast::DataType::TinyInt(_) => Ok(SqlType::Int8Array),
+                ast::DataType::SmallInt(_) | ast::DataType::Int2(_) => Ok(SqlType::Int16Array),
+                ast::DataType::Int4(_)
+                | ast::DataType::Integer(_)
+                | ast::DataType::MediumInt(_)
+                | ast::DataType::Int(_) => Ok(SqlType::Int32Array),
+                ast::DataType::BigInt(_) | ast::DataType::Int8(_) => Ok(SqlType::Int64Array),
+                ast::DataType::Text
+                | ast::DataType::Varchar(_)
+                | ast::DataType::Char(_)
+                | ast::DataType::CharVarying(_)
+                | ast::DataType::CharacterVarying(_)
+                | ast::DataType::Uuid => Ok(SqlType::TextArray),
+                ast::DataType::Real | ast::DataType::Float4 => Ok(SqlType::Float32Array),
+                ast::DataType::Float(_)
+                | ast::DataType::Float8
+                | ast::DataType::Double
+                | ast::DataType::DoublePrecision => Ok(SqlType::Float64Array),
+                _ => Err(SqlgenError::Unsupported(format!(
+                    "data type {data_type} is not supported"
+                ))),
+            },
+            _ => Err(SqlgenError::Unsupported(format!(
                 "data type {data_type} is not supported"
             ))),
         }
@@ -948,6 +1488,15 @@ impl<'a> QueryTables<'a> {
         }
         None
     }
+
+    fn nullify_all_tables(&mut self) {
+        let tables = self
+            .tables
+            .iter()
+            .map(|(name, table)| (name.to_owned(), table.to_nullable()))
+            .collect::<IndexMap<_, _>>();
+        self.tables = tables;
+    }
 }
 
 /// A singleton iterator - yields the contained value exactly once.
@@ -998,7 +1547,7 @@ mod test {
     }
 
     macro_rules! table_with_typed_column_test {
-        ($test_fn:ident, $str_type:expr, $sql_type:expr) => {
+        ($dialect:expr, $test_fn:ident, $str_type:expr, $sql_type:expr) => {
             #[test]
             fn $test_fn() {
                 let expected = Schema {
@@ -1018,9 +1567,7 @@ mod test {
                     )]),
                 };
 
-                let parser = Sqlparser {
-                    dialect: SqlDialect::Sqlite,
-                };
+                let parser = Sqlparser { dialect: $dialect };
 
                 let actual = parser
                     .parse_schema(format!("CREATE TABLE t1(col {});", $str_type))
@@ -1031,33 +1578,393 @@ mod test {
         };
     }
 
-    table_with_typed_column_test!(parse_table_with_bool_column, "BOOL", SqlType::Bool);
-    table_with_typed_column_test!(parse_table_with_boolean_column, "BOOLEAN", SqlType::Bool);
-    table_with_typed_column_test!(parse_table_with_tinyint_column, "TINYINT", SqlType::Int8);
-    table_with_typed_column_test!(parse_table_with_smallint_column, "SMALLINT", SqlType::Int16);
-    table_with_typed_column_test!(parse_table_with_int2_column, "INT2", SqlType::Int16);
-    table_with_typed_column_test!(parse_table_with_int_column, "INT", SqlType::Int32);
-    table_with_typed_column_test!(parse_table_with_integer_column, "INTEGER", SqlType::Int32);
+    /* SQLITE PARSING TEST */
     table_with_typed_column_test!(
-        parse_table_with_mediumint_column,
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_bool_column,
+        "BOOL",
+        SqlType::Bool
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_boolean_column,
+        "BOOLEAN",
+        SqlType::Bool
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_tinyint_column,
+        "TINYINT",
+        SqlType::Int8
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_smallint_column,
+        "SMALLINT",
+        SqlType::Int16
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_int2_column,
+        "INT2",
+        SqlType::Int16
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_int_column,
+        "INT",
+        SqlType::Int32
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_integer_column,
+        "INTEGER",
+        SqlType::Int32
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_mediumint_column,
         "MEDIUMINT",
         SqlType::Int32
     );
-    table_with_typed_column_test!(parse_table_with_int4_column, "INT4", SqlType::Int32);
-    table_with_typed_column_test!(parse_table_with_bigint_column, "BIGINT", SqlType::Int64);
-    table_with_typed_column_test!(parse_table_with_int8_column, "INT8", SqlType::Int64);
-    table_with_typed_column_test!(parse_table_with_text_column, "TEXT", SqlType::Text);
-    table_with_typed_column_test!(parse_table_with_real_column, "REAL", SqlType::Float32);
-    table_with_typed_column_test!(parse_table_with_float4_column, "FLOAT4", SqlType::Float32);
-    table_with_typed_column_test!(parse_table_with_float_column, "FLOAT", SqlType::Float64);
-    table_with_typed_column_test!(parse_table_with_float8_column, "FLOAT8", SqlType::Float64);
-    table_with_typed_column_test!(parse_table_with_double_column, "DOUBLE", SqlType::Float64);
     table_with_typed_column_test!(
-        parse_table_with_double_precision_column,
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_int4_column,
+        "INT4",
+        SqlType::Int32
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_bigint_column,
+        "BIGINT",
+        SqlType::Int64
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_int8_column,
+        "INT8",
+        SqlType::Int64
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_text_column,
+        "TEXT",
+        SqlType::Text
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_real_column,
+        "REAL",
+        SqlType::Float32
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_float4_column,
+        "FLOAT4",
+        SqlType::Float32
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_float_column,
+        "FLOAT",
+        SqlType::Float64
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_float8_column,
+        "FLOAT8",
+        SqlType::Float64
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_double_column,
+        "DOUBLE",
+        SqlType::Float64
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_double_precision_column,
         "DOUBLE PRECISION",
         SqlType::Float64
     );
-    table_with_typed_column_test!(parse_table_with_blob_column, "BLOB", SqlType::Binary);
+    table_with_typed_column_test!(
+        SqlDialect::Sqlite,
+        sqlite_parse_table_with_blob_column,
+        "BLOB",
+        SqlType::Binary
+    );
+
+    /* POSTGRES PARSER TEST */
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_bool_column,
+        "BOOL",
+        SqlType::Bool
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_boolean_column,
+        "BOOLEAN",
+        SqlType::Bool
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_tinyint_column,
+        "TINYINT",
+        SqlType::Int8
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_smallint_column,
+        "SMALLINT",
+        SqlType::Int16
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_int2_column,
+        "INT2",
+        SqlType::Int16
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_int_column,
+        "INT",
+        SqlType::Int32
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_integer_column,
+        "INTEGER",
+        SqlType::Int32
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_mediumint_column,
+        "MEDIUMINT",
+        SqlType::Int32
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_int4_column,
+        "INT4",
+        SqlType::Int32
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_bigint_column,
+        "BIGINT",
+        SqlType::Int64
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_int8_column,
+        "INT8",
+        SqlType::Int64
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_text_column,
+        "TEXT",
+        SqlType::Text
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_real_column,
+        "REAL",
+        SqlType::Float32
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_float4_column,
+        "FLOAT4",
+        SqlType::Float32
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_float_column,
+        "FLOAT",
+        SqlType::Float64
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_float8_column,
+        "FLOAT8",
+        SqlType::Float64
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_double_column,
+        "DOUBLE",
+        SqlType::Float64
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_double_precision_column,
+        "DOUBLE PRECISION",
+        SqlType::Float64
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_blob_column,
+        "BLOB",
+        SqlType::Binary
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_time_column,
+        "TIME",
+        SqlType::DateTime
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_time_without_time_zone_column,
+        "TIME WITHOUT TIME ZONE",
+        SqlType::DateTime
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_time_with_time_zone_column,
+        "TIME WITH TIME ZONE",
+        SqlType::DateTime
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_date_column,
+        "DATE",
+        SqlType::DateTime
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_timestamp_column,
+        "TIMESTAMP",
+        SqlType::DateTime
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_timestamptz_column,
+        "TIMESTAMPTZ",
+        SqlType::DateTime
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_timestamp_without_time_zone_column,
+        "TIMESTAMP WITHOUT TIME ZONE",
+        SqlType::DateTime
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_timestamp_with_time_zone_column,
+        "TIMESTAMP WITH TIME ZONE",
+        SqlType::DateTime
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_uuid_column,
+        "UUID",
+        SqlType::Text
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_bool_array_column,
+        "BOOL[]",
+        SqlType::BoolArray
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_boolean_array_column,
+        "BOOLEAN[]",
+        SqlType::BoolArray
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_tinyint_array_column,
+        "TINYINT[]",
+        SqlType::Int8Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_smallint_array_column,
+        "SMALLINT[]",
+        SqlType::Int16Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_int2_array_column,
+        "INT2[]",
+        SqlType::Int16Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_int_array_column,
+        "INT[]",
+        SqlType::Int32Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_integer_array_column,
+        "INTEGER[]",
+        SqlType::Int32Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_mediumint_array_column,
+        "MEDIUMINT[]",
+        SqlType::Int32Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_int4_array_column,
+        "INT4[]",
+        SqlType::Int32Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_bigint_array_column,
+        "BIGINT[]",
+        SqlType::Int64Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_int8_array_column,
+        "INT8[]",
+        SqlType::Int64Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_text_array_column,
+        "TEXT[]",
+        SqlType::TextArray
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_real_array_column,
+        "REAL[]",
+        SqlType::Float32Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_float4_array_column,
+        "FLOAT4[]",
+        SqlType::Float32Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_float_array_column,
+        "FLOAT[]",
+        SqlType::Float64Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_float8_array_column,
+        "FLOAT8[]",
+        SqlType::Float64Array
+    );
+    table_with_typed_column_test!(
+        SqlDialect::Postgres,
+        postgres_parse_table_with_double_array_column,
+        "DOUBLE[]",
+        SqlType::Float64Array
+    );
 
     #[test]
     fn parse_table_primary_key() {
@@ -4003,6 +4910,238 @@ mod test {
     }
 
     #[test]
+    fn parse_postgres_func_unnest_int32_array() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unnest".to_string(),
+                sqltype: SqlType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Postgres,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT[] NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT unnest(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_postgres_func_unnest_int16_array() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unnest".to_string(),
+                sqltype: SqlType::Int16,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Postgres,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a INT2[] NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT unnest(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_postgres_func_unnest_int8_array() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unnest".to_string(),
+                sqltype: SqlType::Int8,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Postgres,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TINYINT[] NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT unnest(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_postgres_func_unnest_int64_array() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unnest".to_string(),
+                sqltype: SqlType::Int64,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Postgres,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a BIGINT[] NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT unnest(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_postgres_func_unnest_bool_array() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unnest".to_string(),
+                sqltype: SqlType::Bool,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Postgres,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a BOOLEAN[] NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT unnest(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_postgres_func_unnest_float32_array() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unnest".to_string(),
+                sqltype: SqlType::Float32,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Postgres,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a REAL[] NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT unnest(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_postgres_func_unnest_float64_array() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unnest".to_string(),
+                sqltype: SqlType::Float64,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Postgres,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a DOUBLE[] NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT unnest(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_postgres_func_unnest_text_array() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unnest".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Postgres,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT[] NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT unnest(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_postgres_func_unnest_nullable_array() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "unnest".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Postgres,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT[]);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT unnest(col_a) FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_postgres_func_unnest_non_array() {
+        let expected = SqlgenError::Unsupported("cannot unnest non-array type".to_string());
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Postgres,
+        };
+
+        let schema = parser.parse_schema("CREATE TABLE t1(col_a TEXT);").unwrap();
+        let actual = parser
+            .parse_query("SELECT unnest(col_a) FROM t1;", &schema)
+            .unwrap_err();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
     fn parse_select_with_cte() {
         let expected = Query {
             projection: vec![FieldDef {
@@ -4073,5 +5212,188 @@ mod test {
             .unwrap_err();
 
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn parse_union_query() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "col_a".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT * FROM t1 UNION ALL SELECT * FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn parse_intersect_query() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "col_a".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT * FROM t1 INTERSECT ALL SELECT * FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn parse_except_query() {
+        let expected = Query {
+            projection: vec![FieldDef {
+                name: "col_a".to_string(),
+                sqltype: SqlType::Text,
+                nullable: false,
+            }],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("CREATE TABLE t1(col_a TEXT NOT NULL);")
+            .unwrap();
+        let actual = parser
+            .parse_query("SELECT * FROM t1 EXCEPT ALL SELECT * FROM t1;", &schema)
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn parse_left_join_query() {
+        let expected = Query {
+            projection: vec![
+                FieldDef {
+                    name: "col_a".to_string(),
+                    sqltype: SqlType::Text,
+                    nullable: false,
+                },
+                FieldDef {
+                    name: "col_x".to_string(),
+                    sqltype: SqlType::Text,
+                    nullable: true,
+                },
+            ],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("
+                CREATE TABLE t1(col_a TEXT NOT NULL); 
+                CREATE TABLE t2(col_a INT PRIMARY KEY, t1 INT NOT NULL REFERENCES t2, col_x TEXT NOT NULL);
+            ")
+            .unwrap();
+        let actual = parser
+            .parse_query(
+                "SELECT t1.col_a, t2.col_x FROM t1 LEFT JOIN t2 ON t2.t1=t1.col_a;",
+                &schema,
+            )
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn parse_full_join_query() {
+        let expected = Query {
+            projection: vec![
+                FieldDef {
+                    name: "col_a".to_string(),
+                    sqltype: SqlType::Text,
+                    nullable: true,
+                },
+                FieldDef {
+                    name: "col_x".to_string(),
+                    sqltype: SqlType::Text,
+                    nullable: true,
+                },
+            ],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("
+                CREATE TABLE t1(col_a TEXT NOT NULL); 
+                CREATE TABLE t2(col_a INT PRIMARY KEY, t1 INT NOT NULL REFERENCES t2, col_x TEXT NOT NULL);
+            ")
+            .unwrap();
+        let actual = parser
+            .parse_query(
+                "SELECT t1.col_a, t2.col_x FROM t1 FULL JOIN t2 ON t2.t1=t1.col_a;",
+                &schema,
+            )
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn parse_right_join_query() {
+        let expected = Query {
+            projection: vec![
+                FieldDef {
+                    name: "col_a".to_string(),
+                    sqltype: SqlType::Text,
+                    nullable: true,
+                },
+                FieldDef {
+                    name: "col_x".to_string(),
+                    sqltype: SqlType::Text,
+                    nullable: false,
+                },
+            ],
+        };
+
+        let parser = Sqlparser {
+            dialect: SqlDialect::Sqlite,
+        };
+
+        let schema = parser
+            .parse_schema("
+                CREATE TABLE t1(col_a TEXT NOT NULL); 
+                CREATE TABLE t2(col_a INT PRIMARY KEY, t1 INT NOT NULL REFERENCES t2, col_x TEXT NOT NULL);
+            ")
+            .unwrap();
+        let actual = parser
+            .parse_query(
+                "SELECT t1.col_a, t2.col_x FROM t1 RIGHT JOIN t2 ON t2.t1=t1.col_a;",
+                &schema,
+            )
+            .unwrap();
+
+        assert_eq!(actual, expected);
     }
 }

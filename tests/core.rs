@@ -138,3 +138,134 @@ fn golang_sqlite_aggregation() -> io::Result<()> {
     Ok(())
 }
 
+#[test]
+fn typescript_postgres_simple() -> io::Result<()> {
+    let schemafile = "examples/postgres/simple/schema.sql";
+    let queriesdir = "examples/postgres/simple/queries";
+    let outputfile = "examples/postgres/simple/typescript/queries.ts";
+
+    let expected = fs::read_to_string(outputfile).unwrap();
+
+    let mut sqlgen = Sqlgen {
+        schema: fs::read_to_string(schemafile)?,
+        queries: Files::new(queriesdir, SqlFileFilter {})?,
+        code_generator: sqlgen::lang::typescript::TSCodegen {},
+        dialect: SqlDialect::Postgres,
+    };
+
+    let actual = sqlgen.run().unwrap();
+
+    assert_eq!(actual, expected);
+
+    Ok(())
+}
+
+#[test]
+fn golang_postgres_simple() -> io::Result<()> {
+    let schemafile = "examples/postgres/simple/schema.sql";
+    let queriesdir = "examples/postgres/simple/queries";
+    let outputfile = "examples/postgres/simple/golang/queries.go";
+
+    let expected = fs::read_to_string(outputfile).unwrap();
+
+    let mut sqlgen = Sqlgen {
+        schema: fs::read_to_string(schemafile)?,
+        queries: Files::new(queriesdir, SqlFileFilter {})?,
+        code_generator: sqlgen::lang::golang::GoCodegen::default(),
+        dialect: SqlDialect::Postgres,
+    };
+
+    let actual = sqlgen.run().unwrap();
+
+    assert_eq!(actual, expected);
+
+    Ok(())
+}
+
+#[test]
+fn typescript_postgres_migration() -> io::Result<()> {
+    let migration_dir = "examples/postgres/migration/migrations";
+    let queriesdir = "examples/postgres/migration/queries";
+    let outputfile = "examples/postgres/migration/typescript/queries.ts";
+
+    let expected = fs::read_to_string(outputfile).unwrap();
+
+    let mut sqlgen = Sqlgen {
+        schema: Files::new(migration_dir, SqlUpFileFilter {})?.try_into_string()?,
+        queries: Files::new(queriesdir, SqlFileFilter {})?,
+        code_generator: sqlgen::lang::typescript::TSCodegen {},
+        dialect: SqlDialect::Postgres,
+    };
+
+    let actual = sqlgen.run().unwrap();
+
+    assert_eq!(actual, expected);
+
+    Ok(())
+}
+
+#[test]
+fn golang_postgres_migration() -> io::Result<()> {
+    let migration_dir = "examples/postgres/migration/migrations";
+    let queriesdir = "examples/postgres/migration/queries";
+    let outputfile = "examples/postgres/migration/golang/queries.go";
+
+    let expected = fs::read_to_string(outputfile).unwrap();
+
+    let mut sqlgen = Sqlgen {
+        schema: Files::new(migration_dir, SqlUpFileFilter {})?.try_into_string()?,
+        queries: Files::new(queriesdir, SqlFileFilter {})?,
+        code_generator: sqlgen::lang::golang::GoCodegen::default(),
+        dialect: SqlDialect::Postgres,
+    };
+
+    let actual = sqlgen.run().unwrap();
+
+    assert_eq!(actual, expected);
+
+    Ok(())
+}
+
+#[test]
+fn typescript_postgres_aggregation() -> io::Result<()> {
+    let schemafile = "examples/postgres/aggregation/schema.sql";
+    let queriesdir = "examples/postgres/aggregation/queries";
+    let outputfile = "examples/postgres/aggregation/typescript/queries.ts";
+
+    let expected = fs::read_to_string(outputfile).unwrap();
+
+    let mut sqlgen = Sqlgen {
+        schema: fs::read_to_string(schemafile)?,
+        queries: Files::new(queriesdir, SqlFileFilter {})?,
+        code_generator: sqlgen::lang::typescript::TSCodegen {},
+        dialect: SqlDialect::Postgres,
+    };
+
+    let actual = sqlgen.run().unwrap();
+
+    assert_eq!(actual, expected);
+
+    Ok(())
+}
+
+#[test]
+fn golang_postgres_aggregation() -> io::Result<()> {
+    let schemafile = "examples/postgres/aggregation/schema.sql";
+    let queriesdir = "examples/postgres/aggregation/queries";
+    let outputfile = "examples/postgres/aggregation/golang/queries.go";
+
+    let expected = fs::read_to_string(outputfile).unwrap();
+
+    let mut sqlgen = Sqlgen {
+        schema: fs::read_to_string(schemafile)?,
+        queries: Files::new(queriesdir, SqlFileFilter {})?,
+        code_generator: sqlgen::lang::golang::GoCodegen::default(),
+        dialect: SqlDialect::Postgres,
+    };
+
+    let actual = sqlgen.run().unwrap();
+
+    assert_eq!(actual, expected);
+
+    Ok(())
+}

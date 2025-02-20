@@ -102,7 +102,7 @@ impl TSCodegen {
             s.push_str("    ");
             s.push_str(camel_case(field.name()).as_str());
             s.push_str(": ");
-            s.push_str(field.sqltype().into_str());
+            s.push_str(field.sql_type().into_str());
             if field.nullable() {
                 s.push_str(" | null");
             }
@@ -188,6 +188,17 @@ impl SqlTypeExt for SqlType {
             | SqlType::Float64 => "number",
             SqlType::Text => "string",
             SqlType::Binary => "ArrayBuffer",
+            SqlType::DateTime => "Date",
+            SqlType::BoolArray => "boolean[]",
+            SqlType::Int8Array
+            | SqlType::Int16Array
+            | SqlType::Int32Array
+            | SqlType::Int64Array
+            | SqlType::Float32Array
+            | SqlType::Float64Array => "number[]",
+            SqlType::TextArray => "string[]",
+            #[allow(unreachable_patterns)]
+            _ => unimplemented!("type {:?} not implemented for typescript", self),
         }
     }
 }

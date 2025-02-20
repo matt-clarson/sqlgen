@@ -46,7 +46,7 @@ struct ArgParse<'a> {
     iter: Peekable<Enumerate<Chars<'a>>>,
 }
 
-impl<'a> ArgParse<'a> {
+impl ArgParse<'_> {
     fn arg(&mut self) -> Option<Arg> {
         let pos = self.dollar()?;
         let ident = self.ident()?;
@@ -67,15 +67,40 @@ impl<'a> ArgParse<'a> {
 
     fn sql_type(&mut self) -> Option<SqlType> {
         self.ident().and_then(|ident| match ident.as_str() {
-            "tinyint" => Some(SqlType::Int8),
-            "smallint" => Some(SqlType::Int16),
-            "int" => Some(SqlType::Int32),
-            "bigint" => Some(SqlType::Int64),
-            "float" => Some(SqlType::Float32),
-            "double" => Some(SqlType::Float64),
-            "bool" => Some(SqlType::Bool),
-            "text" => Some(SqlType::Text),
+            "tinyint" => self
+                .array_notation()
+                .and(Some(SqlType::Int8Array))
+                .or(Some(SqlType::Int8)),
+            "smallint" => self
+                .array_notation()
+                .and(Some(SqlType::Int16Array))
+                .or(Some(SqlType::Int16)),
+            "int" => self
+                .array_notation()
+                .and(Some(SqlType::Int32Array))
+                .or(Some(SqlType::Int32)),
+            "bigint" => self
+                .array_notation()
+                .and(Some(SqlType::Int64Array))
+                .or(Some(SqlType::Int64)),
+            "float" => self
+                .array_notation()
+                .and(Some(SqlType::Float32Array))
+                .or(Some(SqlType::Float32)),
+            "double" => self
+                .array_notation()
+                .and(Some(SqlType::Float64Array))
+                .or(Some(SqlType::Float64)),
+            "bool" => self
+                .array_notation()
+                .and(Some(SqlType::BoolArray))
+                .or(Some(SqlType::Bool)),
+            "text" => self
+                .array_notation()
+                .and(Some(SqlType::TextArray))
+                .or(Some(SqlType::Text)),
             "blob" => Some(SqlType::Binary),
+            "datetime" => Some(SqlType::DateTime),
             _ => None,
         })
     }
@@ -106,6 +131,19 @@ impl<'a> ArgParse<'a> {
             Some(ident)
         }
     }
+
+    fn array_notation(&mut self) -> Option<usize> {
+        self.open_bracket().and(self.close_bracket())
+    }
+
+    fn open_bracket(&mut self) -> Option<usize> {
+        self.iter.next_if(|n| n.1 == '[').map(|n| n.0)
+    }
+
+    fn close_bracket(&mut self) -> Option<usize> {
+        self.iter.next_if(|n| n.1 == ']').map(|n| n.0)
+    }
+
     fn dollar(&mut self) -> Option<usize> {
         self.iter.next_if(|n| n.1 == '$').map(|n| n.0)
     }
@@ -115,7 +153,7 @@ impl<'a> ArgParse<'a> {
     }
 }
 
-impl<'a> Iterator for ArgParse<'a> {
+impl Iterator for ArgParse<'_> {
     type Item = Arg;
     fn next(&mut self) -> Option<Self::Item> {
         self.take_non_dollar();
@@ -160,6 +198,20 @@ mod test {
     }
 
     #[test]
+    fn valid_int_array_arg() {
+        let expected = vec![Arg {
+            arg_type: Some(ArgType::NonNullable(SqlType::Int32Array)),
+            ident: "x".to_string(),
+            pos: 0,
+            len: 9,
+        }];
+
+        let actual = args("$x::int[]");
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
     fn valid_bool_arg() {
         let expected = vec![Arg {
             arg_type: Some(ArgType::NonNullable(SqlType::Bool)),
@@ -169,6 +221,20 @@ mod test {
         }];
 
         let actual = args("$x::bool");
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn valid_bool_array_arg() {
+        let expected = vec![Arg {
+            arg_type: Some(ArgType::NonNullable(SqlType::BoolArray)),
+            ident: "x".to_string(),
+            pos: 0,
+            len: 10,
+        }];
+
+        let actual = args("$x::bool[]");
 
         assert_eq!(expected, actual);
     }
@@ -188,6 +254,20 @@ mod test {
     }
 
     #[test]
+    fn valid_bigint_array_arg() {
+        let expected = vec![Arg {
+            arg_type: Some(ArgType::NonNullable(SqlType::Int64Array)),
+            ident: "x".to_string(),
+            pos: 0,
+            len: 12,
+        }];
+
+        let actual = args("$x::bigint[]");
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
     fn valid_smallint_arg() {
         let expected = vec![Arg {
             arg_type: Some(ArgType::NonNullable(SqlType::Int16)),
@@ -197,6 +277,20 @@ mod test {
         }];
 
         let actual = args("$x::smallint");
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn valid_smallint_array_arg() {
+        let expected = vec![Arg {
+            arg_type: Some(ArgType::NonNullable(SqlType::Int16Array)),
+            ident: "x".to_string(),
+            pos: 0,
+            len: 14,
+        }];
+
+        let actual = args("$x::smallint[]");
 
         assert_eq!(expected, actual);
     }
@@ -216,6 +310,20 @@ mod test {
     }
 
     #[test]
+    fn valid_tinyint_array_arg() {
+        let expected = vec![Arg {
+            arg_type: Some(ArgType::NonNullable(SqlType::Int8Array)),
+            ident: "x".to_string(),
+            pos: 0,
+            len: 13,
+        }];
+
+        let actual = args("$x::tinyint[]");
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
     fn valid_float_arg() {
         let expected = vec![Arg {
             arg_type: Some(ArgType::NonNullable(SqlType::Float32)),
@@ -225,6 +333,20 @@ mod test {
         }];
 
         let actual = args("$x::float");
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn valid_float_array_arg() {
+        let expected = vec![Arg {
+            arg_type: Some(ArgType::NonNullable(SqlType::Float32Array)),
+            ident: "x".to_string(),
+            pos: 0,
+            len: 11,
+        }];
+
+        let actual = args("$x::float[]");
 
         assert_eq!(expected, actual);
     }
@@ -244,6 +366,20 @@ mod test {
     }
 
     #[test]
+    fn valid_double_array_arg() {
+        let expected = vec![Arg {
+            arg_type: Some(ArgType::NonNullable(SqlType::Float64Array)),
+            ident: "x".to_string(),
+            pos: 0,
+            len: 12,
+        }];
+
+        let actual = args("$x::double[]");
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
     fn valid_text_arg() {
         let expected = vec![Arg {
             arg_type: Some(ArgType::NonNullable(SqlType::Text)),
@@ -258,6 +394,20 @@ mod test {
     }
 
     #[test]
+    fn valid_text_array_arg() {
+        let expected = vec![Arg {
+            arg_type: Some(ArgType::NonNullable(SqlType::TextArray)),
+            ident: "x".to_string(),
+            pos: 0,
+            len: 10,
+        }];
+
+        let actual = args("$x::text[]");
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
     fn valid_blob_arg() {
         let expected = vec![Arg {
             arg_type: Some(ArgType::NonNullable(SqlType::Binary)),
@@ -267,6 +417,20 @@ mod test {
         }];
 
         let actual = args("$x::blob");
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn valid_datetime_arg() {
+        let expected = vec![Arg {
+            arg_type: Some(ArgType::NonNullable(SqlType::DateTime)),
+            ident: "x".to_string(),
+            pos: 0,
+            len: 12,
+        }];
+
+        let actual = args("$x::datetime");
 
         assert_eq!(expected, actual);
     }
