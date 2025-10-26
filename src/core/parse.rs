@@ -359,7 +359,7 @@ impl Sqlparser {
         name: &ast::ObjectName,
     ) -> Result<(), SqlgenError> {
         let table_name = name.0.last().unwrap().to_string();
-        if let Some(table) = query_tables.find_table_in_schema(&name.to_string()) {
+        if let Some(table) = query_tables.find_table_in_schema(name.to_string()) {
             query_tables.insert_table(table_name, table.clone());
             Ok(())
         } else {
@@ -380,7 +380,7 @@ impl Sqlparser {
                     .as_ref()
                     .map(|a| a.name.to_string())
                     .unwrap_or_else(|| name.0.last().unwrap().to_string());
-                if let Some(table) = query_tables.find_table_in_schema(&name.to_string()) {
+                if let Some(table) = query_tables.find_table_in_schema(name.to_string()) {
                     query_tables.insert_table(table_name, table.clone());
                     Ok(())
                 } else {
@@ -399,7 +399,6 @@ impl Sqlparser {
 
                 let subquery_out = self.parse_select_query(subquery, query_tables)?;
                 query_tables.insert_table_from_query(&table_name, &subquery_out);
-                dbg!(query_tables);
                 Ok(())
             }
             _ => Err(SqlgenError::Unsupported(
@@ -435,7 +434,7 @@ impl Sqlparser {
             }
         }
 
-        return match query.body.as_ref() {
+        match query.body.as_ref() {
             ast::SetExpr::Select(select) => {
                 for table_with_joins in &select.from {
                     for join in &table_with_joins.joins {
@@ -451,13 +450,13 @@ impl Sqlparser {
                     out_query.projection.push(field?);
                 }
 
-                return Ok(out_query);
+                Ok(out_query)
             }
             _ => Err(SqlgenError::Unsupported(
                 "only SELECT, UPDATE, INSERT, and DELETE statements are supported in queries"
                     .to_string(),
             )),
-        };
+        }
     }
 }
 
@@ -534,13 +533,11 @@ impl<'a> SqliteFieldIter<'a> {
         match expr {
             ast::Expr::Identifier(ident) => self
                 .query_tables
-                .find_field(&ident.value)
-                .map(Clone::clone)
+                .find_field(&ident.value).cloned()
                 .ok_or_else(|| SqlgenError::EntityNotFound(ident.to_string())),
             ast::Expr::CompoundIdentifier(idents) => self
                 .query_tables
-                .find_qualified_field(idents)
-                .map(Clone::clone)
+                .find_qualified_field(idents).cloned()
                 .ok_or_else(|| SqlgenError::EntityNotFound(compound_name(idents))),
             ast::Expr::Function(func) => self.builtin_func_to_field(func),
             _ => Err(SqlgenError::Unsupported(format!(

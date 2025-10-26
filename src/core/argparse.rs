@@ -52,8 +52,8 @@ impl<'a> ArgParse<'a> {
         let ident = self.ident()?;
         let arg_type = self.double_colon().and_then(|_| {
             self.question_mark()
-                .and_then(|_| self.sql_type().map(|st| ArgType::Nullable(st)))
-                .or_else(|| self.sql_type().map(|st| ArgType::NonNullable(st)))
+                .and_then(|_| self.sql_type().map(ArgType::Nullable))
+                .or_else(|| self.sql_type().map(ArgType::NonNullable))
         });
         let len = self.iter.peek().map(|n| n.0).unwrap_or(self.len) - pos;
 

@@ -102,6 +102,6 @@ impl From<io::Error> for FilesError {
 }
 impl From<FilesError> for io::Error {
     fn from(value: FilesError) -> Self {
-        Self::new(io::ErrorKind::Other, value.to_string())
+        Self::other(value.to_string())
     }
 }

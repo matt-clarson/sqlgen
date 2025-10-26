@@ -55,7 +55,6 @@ where
 
         for entry_result in self.queries.by_ref() {
             let mut entry = entry_result?;
-            dbg!(&entry.name);
             let mut query_sql = String::new();
             entry.source.read_to_string(&mut query_sql)?;
 
@@ -97,8 +96,6 @@ fn replace<S: AsRef<str>>(sql: S, dialect: SqlDialect, args: &[argparse::Arg]) -
     let s = sql.as_ref();
 
     let mut pos = 0;
-
-    dbg!(args);
 
     let mut out = args.iter().fold(String::new(), |acc, x| {
         let binding = match dialect {
