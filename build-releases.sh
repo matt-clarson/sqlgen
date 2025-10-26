@@ -14,7 +14,10 @@ targets=(
     "aarch64-apple-darwin:nocross:noext"
     "x86_64-apple-darwin:nocross:noext"
     "x86_64-unknown-linux-gnu:cross:noext"
-    "x86_64-pc-windows-gnu:cross:.exe"
+    # NOTE: unable to build for windows while on macos / arm64
+    # potentially related to https://github.com/cross-rs/cross/issues/1214
+    #
+    # "x86_64-pc-windows-gnu:cross:.exe"
 )
 
 printf "Plan:\n"
@@ -51,7 +54,7 @@ for target in ${targets[@]}; do
         cargo build --release --target $triple &>>$log
     else
         printf "Building for target $triple using cross, this might take a while...\n"
-        cross build --release --target $triple &>>$log
+        cross build --verbose --release --target $triple &>>$log
     fi
 
     if [ $? == 0 ]; then
