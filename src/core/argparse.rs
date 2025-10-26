@@ -7,16 +7,21 @@ use super::SqlType;
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Arg {
-    sql_type: SqlType,
-    nullable: bool,
+    arg_type: Option<ArgType>,
     ident: String,
     pos: usize,
     len: usize,
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ArgType {
+    Nullable(SqlType),
+    NonNullable(SqlType),
+}
+
 impl Arg {
-    pub fn sql_type(&self) -> SqlType {
-        self.sql_type
+    pub fn arg_type(&self) -> Option<ArgType> {
+        self.arg_type
     }
 
     pub fn ident(&self) -> &str {
@@ -29,10 +34,6 @@ impl Arg {
 
     pub fn len(&self) -> usize {
         self.len
-    }
-
-    pub fn nullable(&self) -> bool {
-        self.nullable
     }
 }
 
@@ -49,14 +50,15 @@ impl<'a> ArgParse<'a> {
     fn arg(&mut self) -> Option<Arg> {
         let pos = self.dollar()?;
         let ident = self.ident()?;
-        self.double_colon()?;
-        let nullable = self.question_mark().is_some();
-        let sql_type = self.sql_type()?;
+        let arg_type = self.double_colon().and_then(|_| {
+            self.question_mark()
+                .and_then(|_| self.sql_type().map(|st| ArgType::Nullable(st)))
+                .or_else(|| self.sql_type().map(|st| ArgType::NonNullable(st)))
+        });
         let len = self.iter.peek().map(|n| n.0).unwrap_or(self.len) - pos;
 
         Some(Arg {
-            sql_type,
-            nullable,
+            arg_type,
             ident,
             pos,
             len,
@@ -146,8 +148,7 @@ mod test {
     #[test]
     fn valid_int_arg() {
         let expected = vec![Arg {
-            sql_type: SqlType::Int32,
-            nullable: false,
+            arg_type: Some(ArgType::NonNullable(SqlType::Int32)),
             ident: "x".to_string(),
             pos: 0,
             len: 7,
@@ -161,8 +162,7 @@ mod test {
     #[test]
     fn valid_bool_arg() {
         let expected = vec![Arg {
-            sql_type: SqlType::Bool,
-            nullable: false,
+            arg_type: Some(ArgType::NonNullable(SqlType::Bool)),
             ident: "x".to_string(),
             pos: 0,
             len: 8,
@@ -176,8 +176,7 @@ mod test {
     #[test]
     fn valid_bigint_arg() {
         let expected = vec![Arg {
-            sql_type: SqlType::Int64,
-            nullable: false,
+            arg_type: Some(ArgType::NonNullable(SqlType::Int64)),
             ident: "x".to_string(),
             pos: 0,
             len: 10,
@@ -191,8 +190,7 @@ mod test {
     #[test]
     fn valid_smallint_arg() {
         let expected = vec![Arg {
-            sql_type: SqlType::Int16,
-            nullable: false,
+            arg_type: Some(ArgType::NonNullable(SqlType::Int16)),
             ident: "x".to_string(),
             pos: 0,
             len: 12,
@@ -206,8 +204,7 @@ mod test {
     #[test]
     fn valid_tinyint_arg() {
         let expected = vec![Arg {
-            sql_type: SqlType::Int8,
-            nullable: false,
+            arg_type: Some(ArgType::NonNullable(SqlType::Int8)),
             ident: "x".to_string(),
             pos: 0,
             len: 11,
@@ -221,8 +218,7 @@ mod test {
     #[test]
     fn valid_float_arg() {
         let expected = vec![Arg {
-            sql_type: SqlType::Float32,
-            nullable: false,
+            arg_type: Some(ArgType::NonNullable(SqlType::Float32)),
             ident: "x".to_string(),
             pos: 0,
             len: 9,
@@ -236,8 +232,7 @@ mod test {
     #[test]
     fn valid_double_arg() {
         let expected = vec![Arg {
-            sql_type: SqlType::Float64,
-            nullable: false,
+            arg_type: Some(ArgType::NonNullable(SqlType::Float64)),
             ident: "x".to_string(),
             pos: 0,
             len: 10,
@@ -251,8 +246,7 @@ mod test {
     #[test]
     fn valid_text_arg() {
         let expected = vec![Arg {
-            sql_type: SqlType::Text,
-            nullable: false,
+            arg_type: Some(ArgType::NonNullable(SqlType::Text)),
             ident: "x".to_string(),
             pos: 0,
             len: 8,
@@ -266,8 +260,7 @@ mod test {
     #[test]
     fn valid_blob_arg() {
         let expected = vec![Arg {
-            sql_type: SqlType::Binary,
-            nullable: false,
+            arg_type: Some(ArgType::NonNullable(SqlType::Binary)),
             ident: "x".to_string(),
             pos: 0,
             len: 8,
@@ -282,15 +275,13 @@ mod test {
     fn two_args() {
         let expected = vec![
             Arg {
-                sql_type: SqlType::Text,
-                nullable: false,
+                arg_type: Some(ArgType::NonNullable(SqlType::Text)),
                 ident: "x".to_string(),
                 pos: 0,
                 len: 8,
             },
             Arg {
-                sql_type: SqlType::Int32,
-                nullable: false,
+                arg_type: Some(ArgType::NonNullable(SqlType::Int32)),
                 ident: "y".to_string(),
                 pos: 9,
                 len: 7,
@@ -305,14 +296,27 @@ mod test {
     #[test]
     fn nullable_arg() {
         let expected = vec![Arg {
-            sql_type: SqlType::Text,
-            nullable: true,
+            arg_type: Some(ArgType::Nullable(SqlType::Text)),
             ident: "x".to_string(),
             pos: 0,
             len: 9,
         }];
 
         let actual = args("$x::?text");
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn untyped_arg() {
+        let expected = vec![Arg {
+            arg_type: None,
+            ident: "x".to_string(),
+            pos: 0,
+            len: 2,
+        }];
+
+        let actual = args("$x;");
 
         assert_eq!(expected, actual);
     }

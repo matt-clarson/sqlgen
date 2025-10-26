@@ -156,3 +156,34 @@ export async function queryJoined(
     return mapRows<QueryJoinedResult>(result.keys, result.rows);
 }
 
+export type UpsertTable1Arg = {
+    id: number;
+    colA: string | null;
+    colB: string;
+};
+
+export async function upsertTable1(
+    dispatch: Dispatcher,
+    arg: UpsertTable1Arg,
+): Promise<void> {
+    const query = `
+        INSERT INTO table_1
+        VALUES (
+            ?,
+            ?,
+            ?
+        ) ON CONFLICT DO
+            UPDATE
+            SET col_a=?,
+                col_b=?;
+    `;
+
+    await dispatch(query, [
+        arg.id,
+        arg.colA,
+        arg.colB,
+        arg.colA,
+        arg.colB,
+    ]);
+}
+

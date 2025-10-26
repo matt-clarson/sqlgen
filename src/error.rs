@@ -19,6 +19,8 @@ impl std::error::Error for SqlgenBuilderError {}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum SqlgenError {
+    UntypedArg(String),
+    ConflictingArgType(String),
     EntityNotFound(String),
     EmptyQuery,
     CodegenError(CodegenError),
@@ -30,6 +32,10 @@ pub enum SqlgenError {
 impl std::fmt::Display for SqlgenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UntypedArg(ident) => write!(f, "found untyped arg: {ident}"),
+            Self::ConflictingArgType(ident) => {
+                write!(f, "found arg with conflicting types: {ident}")
+            }
             Self::EntityNotFound(msg) => write!(f, "entity not found: {msg}"),
             Self::EmptyQuery => f.write_str("query file has no sql statements"),
             Self::CodegenError(err) => write!(f, "codegen error: {err}"),

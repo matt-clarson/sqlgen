@@ -1,5 +1,5 @@
 use crate::{
-    core::{NamedQuery, SqlType},
+    core::{ArgType, NamedQuery, SqlType},
     error::CodegenError,
 };
 
@@ -71,14 +71,21 @@ impl TSCodegen {
         s.push_str(" = {\n");
 
         for arg in named_query.args() {
-            s.push_str("    ");
-            s.push_str(camel_case(arg.ident()).as_str());
-            s.push_str(": ");
-            s.push_str(arg.sql_type().into_str());
-            if arg.nullable() {
-                s.push_str(" | null");
+            if let Some(arg_type) = arg.arg_type() {
+                s.push_str("    ");
+                s.push_str(camel_case(arg.ident()).as_str());
+                s.push_str(": ");
+                match arg_type {
+                    ArgType::Nullable(sql_type) => {
+                        s.push_str(sql_type.into_str());
+                        s.push_str(" | null");
+                    }
+                    ArgType::NonNullable(sql_type) => {
+                        s.push_str(sql_type.into_str());
+                    }
+                }
+                s.push_str(";\n");
             }
-            s.push_str(";\n");
         }
         s.push_str("};\n\n");
     }

@@ -143,9 +143,10 @@ The output type will be:
 Specifically, an argument is defined as follows:
 
 ```ebnf
-arg = "$" ident "::" [ "?" ] type
+arg = "$" ident [ arg_type ]
 ident = alpha { alphanum }
 alphanum = alpha | "0" | "1" | "2" | "3" | "4" | "5" | "8" | "9";
+arg_type = "::" [ "?" ] type
 type = "tinyint" | "smallint" | "int" | "bigint"
      | "float" | "double" | "bool" | "text" | "blob";
 alpha = "A" | "B" | "C" | "D" | "E" | "F" | "G"
@@ -201,6 +202,18 @@ let myarg: number | null;
 ```golang
 // in go
 var myarg sql.NullInt32
+```
+
+When the same variable is used in multiple parts of the query, you can omit the type from all but one instance of the variable's use:
+
+```sql
+INSERT INTO my_table
+VALUES (
+    $id::int,
+    $field_a::text
+) ON CONFLICT DO
+    UPDATE
+    SET field_a=$field_a;
 ```
 
 ### Languages

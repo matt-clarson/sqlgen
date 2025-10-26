@@ -212,3 +212,33 @@ func QueryJoined(ctx context.Context, db SqlQueryer, arg QueryJoinedArg) ([]Quer
 	return results, rows.Err()
 }
 
+type UpsertTable1Arg struct {
+	Id   int32
+	ColA sql.NullString
+	ColB string
+}
+
+func UpsertTable1(ctx context.Context, db SqlExecer, arg UpsertTable1Arg) error {
+	query := `
+        INSERT INTO table_1
+        VALUES (
+            ?,
+            ?,
+            ?
+        ) ON CONFLICT DO
+            UPDATE
+            SET col_a=?,
+                col_b=?;
+    `
+
+	_, err := db.ExecContext(ctx, query,
+		arg.Id,
+		arg.ColA,
+		arg.ColB,
+		arg.ColA,
+		arg.ColB,
+	)
+
+	return err
+}
+

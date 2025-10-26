@@ -1,6 +1,6 @@
 use std::{cmp::max, ffi::OsStr, path::Path};
 
-use crate::core::{NamedQuery, SqlType};
+use crate::core::{ArgType, NamedQuery, SqlType};
 
 use super::{indent_lines, pascal_case, Codegen};
 
@@ -112,19 +112,24 @@ impl GoCodegen {
             .fold(0usize, |acc, x| max(acc, pascal_case(x.ident()).len()));
 
         for arg in named_query.args() {
-            s.push('\t');
-            let name = pascal_case(arg.ident());
-            s.push_str(name.as_str());
-            let padding = longest_arg_length - name.len() + 1;
-            for _ in 0..padding {
-                s.push(' ');
+            if let Some(arg_type) = arg.arg_type() {
+                s.push('\t');
+                let name = pascal_case(arg.ident());
+                s.push_str(name.as_str());
+                let padding = longest_arg_length - name.len() + 1;
+                for _ in 0..padding {
+                    s.push(' ');
+                }
+                match arg_type {
+                    ArgType::Nullable(sql_type) => {
+                        s.push_str(sql_type.into_null_str());
+                    }
+                    ArgType::NonNullable(sql_type) => {
+                        s.push_str(sql_type.into_strict_str());
+                    }
+                }
+                s.push('\n');
             }
-            if arg.nullable() {
-                s.push_str(arg.sql_type().into_null_str());
-            } else {
-                s.push_str(arg.sql_type().into_strict_str());
-            }
-            s.push('\n');
         }
         s.push_str("}\n\n");
     }

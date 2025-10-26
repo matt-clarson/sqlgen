@@ -2,6 +2,7 @@ mod argparse;
 mod parse;
 
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     fs::{self, DirEntry, ReadDir},
     io::{self, Read},
@@ -13,6 +14,7 @@ use crate::{
     lang::Codegen,
 };
 
+pub use argparse::ArgType;
 pub use parse::NamedQuery;
 pub use parse::SqlType;
 
@@ -53,10 +55,28 @@ where
 
         for entry_result in self.queries.by_ref() {
             let mut entry = entry_result?;
+            dbg!(&entry.name);
             let mut query_sql = String::new();
             entry.source.read_to_string(&mut query_sql)?;
 
             let args = argparse::args(&query_sql);
+
+            let typed_args = args
+                .iter()
+                .filter_map(|a| a.arg_type().map(|t| (a.ident().to_string(), t)))
+                .collect::<HashMap<_, _>>();
+
+            for arg in &args {
+                if arg.arg_type().is_none() && !typed_args.contains_key(arg.ident()) {
+                    return Err(SqlgenError::UntypedArg(arg.ident().to_string()));
+                }
+                if arg
+                    .arg_type()
+                    .is_some_and(|t| typed_args.get(arg.ident()) != Some(&t))
+                {
+                    return Err(SqlgenError::ConflictingArgType(arg.ident().to_string()));
+                }
+            }
 
             let raw_query = replace(&query_sql, self.dialect, &args);
 
@@ -77,6 +97,8 @@ fn replace<S: AsRef<str>>(sql: S, dialect: SqlDialect, args: &[argparse::Arg]) -
     let s = sql.as_ref();
 
     let mut pos = 0;
+
+    dbg!(args);
 
     let mut out = args.iter().fold(String::new(), |acc, x| {
         let binding = match dialect {
